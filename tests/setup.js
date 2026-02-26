@@ -45,9 +45,3 @@ afterAll(async () => {
   console.log('Test database disconnected');
 });
 
-// Set test environment variables
-process.env.NODE_ENV = 'test';
-process.env.JWT_SECRET = 'test-jwt-secret-key-for-testing-only';
-process.env.JWT_REFRESH_SECRET = 'test-jwt-refresh-secret-for-testing';
-process.env.ENCRYPTION_KEY ??= 'test-only-64-char-key...';
-process.env.GROQ_API_KEY = 'test-groq-api-key';
