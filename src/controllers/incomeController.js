@@ -117,6 +117,25 @@ exports.createIncome = async (req, res, next) => {
     // Populate category details
     await income.populate('categoryId', 'name icon color type');
 
+    try {
+      const { addNotificationJob } = require('../config/queue');
+      await addNotificationJob({
+        userId,
+        type: 'transaction_alert',
+        urgency: 'instant',
+        data: {
+          amount: income.amount,
+          description: income.description || income.source || 'New income added',
+          category: income.categoryId?.name || category.name,
+          transactionType: 'income',
+          transactionId: income._id.toString(),
+          date: income.date
+        }
+      });
+    } catch (notificationError) {
+      console.warn('Failed to enqueue income notification:', notificationError.message);
+    }
+
     return successResponse(
       res,
       { income },

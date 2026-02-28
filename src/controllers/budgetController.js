@@ -36,8 +36,8 @@ exports.updateBudget = async (req, res, next) => {
     if (num !== null && (isNaN(num) || num < 0)) {
       return errorResponse(res, 'Amount must be a non-negative number', 400);
     }
-    if (num !== null && num > 100_000_000) {
-      return errorResponse(res, 'Budget cannot exceed ₦100,000,000', 400);
+    if (num !== null && num > 50_000_000) {
+      return errorResponse(res, 'Budget cannot exceed ₦50,000,000', 400);
     }
 
     const user = await User.findByIdAndUpdate(

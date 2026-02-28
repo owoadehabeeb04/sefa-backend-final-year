@@ -2,13 +2,13 @@ const ImportJob = require('../models/ImportJob');
 const ImportedTransactionMap = require('../models/ImportedTransactionMap');
 const Expense = require('../models/Expense');
 const Income = require('../models/Income');
+const Category = require('../models/Category');
 
 const { downloadFromGridFS, deleteFromGridFS } = require('../config/gridfs');
 const { parseCSV, parsePDF, extractTransactionsFromPDFText } = require('../services/parsing.service');
 const { extractTransactionsFromScannedPDF, validateExtractedTransactions } = require('../services/ocr.service');
 const { batchCheckDuplicates, deduplicateTransactionList } = require('../services/deduplication.service');
 const { detectTransfers } = require('../services/transfer.service');
-const { addNotificationJob } = require('../config/queue');
 
 /**
  * Import Queue Processor
@@ -28,6 +28,7 @@ const processImportJob = async (job) => {
   
   let importJob = null;
   let fileBuffer = null;
+  let shouldDeleteFile = false;
   
   try {
     // Create import job record
@@ -123,21 +124,20 @@ const processImportJob = async (job) => {
     // Step 7: Update job status
     importJob.status = 'completed';
     importJob.progress = 100;
-    importJob.results = {
-      totalTransactions: transactions.length + deduped.removedCount,
-      importedCount: saveResult.expenseCount + saveResult.incomeCount,
-      duplicateCount: duplicationCheck.duplicateCount + deduped.removedCount,
-      errorCount: 0,
-      transferPairCount: transferDetection.pairCount,
-      expenseCount: saveResult.expenseCount,
-      incomeCount: saveResult.incomeCount
-    };
+    importJob.stage = 'completed';
+    importJob.completedAt = new Date();
+    importJob.totalTransactions = transactions.length + deduped.removedCount;
+    importJob.importedCount = saveResult.expenseCount + saveResult.incomeCount;
+    importJob.duplicateCount = duplicationCheck.duplicateCount + deduped.removedCount;
+    importJob.errorCount = 0;
+    importJob.errors = [];
     await importJob.save();
     job.progress(100);
     
     console.log('✅ Import completed successfully');
     
     // Send completion notification
+    const { addNotificationJob } = require('../config/queue');
     await addNotificationJob({
       userId,
       type: 'import_complete',
@@ -145,37 +145,48 @@ const processImportJob = async (job) => {
       data: {
         importJobId: importJob._id.toString(),
         fileName,
-        importedCount: importJob.results.importedCount,
-        duplicateCount: importJob.results.duplicateCount
+        importedCount: importJob.importedCount,
+        duplicateCount: importJob.duplicateCount
       }
     });
+
+    shouldDeleteFile = true;
     
     return {
       success: true,
       importJobId: importJob._id,
-      results: importJob.results
+      results: {
+        totalTransactions: importJob.totalTransactions,
+        importedCount: importJob.importedCount,
+        duplicateCount: importJob.duplicateCount,
+        errorCount: importJob.errorCount
+      }
     };
     
   } catch (error) {
     console.error('❌ Import processing failed:', error);
+
+    const maxAttempts = job?.opts?.attempts || 1;
+    const isFinalAttempt = job.attemptsMade >= (maxAttempts - 1);
+    shouldDeleteFile = isFinalAttempt;
     
     // Update job status
     if (importJob) {
       importJob.status = 'failed';
-      importJob.errorMessage = error.message;
-      importJob.results = {
-        totalTransactions: 0,
-        importedCount: 0,
-        duplicateCount: 0,
-        errorCount: 1
-      };
+      importJob.stage = 'completed';
+      importJob.completedAt = new Date();
+      importJob.totalTransactions = 0;
+      importJob.importedCount = 0;
+      importJob.duplicateCount = 0;
+      importJob.errorCount = 1;
+      importJob.errors = [error.message];
       await importJob.save();
     }
     
     throw error;
   } finally {
-    // Cleanup: Delete file from GridFS after processing
-    if (fileId && fileBuffer) {
+    // Cleanup: Delete file from GridFS after success or final failed attempt
+    if (fileId && shouldDeleteFile) {
       try {
         await deleteFromGridFS(fileId);
         console.log('🗑️  File deleted from GridFS');
@@ -195,6 +206,40 @@ const processImportJob = async (job) => {
  */
 const saveTransactions = async (transferDetection, userId, importJobId) => {
   const { pairs, unmatchedDebits, unmatchedCredits } = transferDetection;
+
+  const fallbackCategoryCache = {
+    expense: null,
+    income: null,
+  };
+
+  const getOrCreateFallbackCategoryId = async (type) => {
+    if (fallbackCategoryCache[type]) return fallbackCategoryCache[type];
+
+    let category = await Category.findOne({ userId, type, isActive: true })
+      .sort({ source: 1, createdAt: 1 })
+      .select('_id')
+      .lean();
+
+    if (!category) {
+      const name = type === 'expense' ? 'Uncategorized Expense' : 'Uncategorized Income';
+      const created = await Category.create({
+        userId,
+        name,
+        type,
+        icon: 'folder',
+        color: '#95A5A6',
+        source: 'system',
+        isActive: true,
+      });
+      category = { _id: created._id };
+    }
+
+    fallbackCategoryCache[type] = category._id;
+    return category._id;
+  };
+
+  const expenseCategoryId = await getOrCreateFallbackCategoryId('expense');
+  const incomeCategoryId = await getOrCreateFallbackCategoryId('income');
   
   const savedExpenses = [];
   const savedIncomes = [];
@@ -205,10 +250,10 @@ const saveTransactions = async (transferDetection, userId, importJobId) => {
     // Save expense (debit)
     const expense = await Expense.create({
       userId,
+      categoryId: expenseCategoryId,
       amount: pair.debit.amount,
       description: pair.debit.description,
       date: pair.debit.date,
-      category: 'Transfer',
       paymentMethod: 'bank_transfer',
       isImported: true,
       importJobId,
@@ -219,6 +264,7 @@ const saveTransactions = async (transferDetection, userId, importJobId) => {
     // Save income (credit)
     const income = await Income.create({
       userId,
+      categoryId: incomeCategoryId,
       amount: pair.credit.amount,
       description: pair.credit.description,
       date: pair.credit.date,
@@ -261,10 +307,10 @@ const saveTransactions = async (transferDetection, userId, importJobId) => {
   for (const debit of unmatchedDebits) {
     const expense = await Expense.create({
       userId,
+      categoryId: expenseCategoryId,
       amount: debit.amount,
       description: debit.description,
       date: debit.date,
-      category: 'Uncategorized',
       paymentMethod: 'bank_transfer',
       isImported: true,
       importJobId,
@@ -287,6 +333,7 @@ const saveTransactions = async (transferDetection, userId, importJobId) => {
   for (const credit of unmatchedCredits) {
     const income = await Income.create({
       userId,
+      categoryId: incomeCategoryId,
       amount: credit.amount,
       description: credit.description,
       date: credit.date,
@@ -309,9 +356,45 @@ const saveTransactions = async (transferDetection, userId, importJobId) => {
     });
   }
   
-  // Batch insert mappings
+  // Batch upsert mappings (idempotent, avoids duplicate key failures on retries)
   if (mappings.length > 0) {
-    await ImportedTransactionMap.insertMany(mappings);
+    const operations = [];
+
+    for (const mapping of mappings) {
+      if (mapping.externalId) {
+        operations.push({
+          updateOne: {
+            filter: {
+              userId: mapping.userId,
+              externalId: mapping.externalId,
+            },
+            update: {
+              $set: {
+                importJobId: mapping.importJobId,
+                rawData: mapping.rawData,
+                ...(mapping.expenseId ? { expenseId: mapping.expenseId, incomeId: null } : {}),
+                ...(mapping.incomeId ? { incomeId: mapping.incomeId, expenseId: null } : {}),
+              },
+              $setOnInsert: {
+                userId: mapping.userId,
+                externalId: mapping.externalId,
+              },
+            },
+            upsert: true,
+          },
+        });
+      } else {
+        operations.push({
+          insertOne: {
+            document: mapping,
+          },
+        });
+      }
+    }
+
+    if (operations.length > 0) {
+      await ImportedTransactionMap.bulkWrite(operations, { ordered: false });
+    }
   }
   
   return {

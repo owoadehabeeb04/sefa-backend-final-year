@@ -5,6 +5,7 @@ const cors = require('cors');
 const morgan = require('morgan');
 const helmet = require('helmet');
 const connectDB = require('./config/database');
+const { initGridFS } = require('./config/gridfs');
 const { swaggerSetup } = require('./config/swagger');
 const { startCleanupJob } = require('./utils/cleanupJob');
 const { initializeProcessors, closeQueues } = require('./config/queue');
@@ -13,20 +14,8 @@ const { startSyncCronJobs, stopSyncCronJobs } = require('./jobs/syncCronJobs');
 
 const app = express();
 
-// Connect to MongoDB
-connectDB();
-
 // Start cleanup job for unverified users
 startCleanupJob();
-
-// Initialize queue processors (after DB connection)
-initializeProcessors();
-
-// Start notification schedulers
-schedulerService.start();
-
-// Start sync cron jobs
-startSyncCronJobs();
 
 // Swagger documentation
 swaggerSetup(app);
@@ -73,15 +62,44 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
+let server;
 
-const server = app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-});
+const bootstrap = async () => {
+  try {
+    // Connect to MongoDB first
+    await connectDB();
+
+    // Initialize GridFS after MongoDB is connected
+    initGridFS();
+
+    // Initialize queue processors after DB connection
+    initializeProcessors();
+
+    // Start notification schedulers
+    schedulerService.start();
+
+    // Start sync cron jobs
+    startSyncCronJobs();
+
+    server = app.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
+      console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+    });
+  } catch (error) {
+    console.error('Failed to bootstrap server:', error);
+    process.exit(1);
+  }
+};
+
+bootstrap();
 
 // Graceful shutdown
 const gracefulShutdown = async (signal) => {
   console.log(`\n${signal} signal received: closing server gracefully`);
+
+  if (!server) {
+    process.exit(0);
+  }
   
   server.close(async () => {
     console.log('HTTP server closed');

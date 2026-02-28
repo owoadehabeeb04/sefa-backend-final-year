@@ -1,6 +1,9 @@
 const syncScheduler = require('../services/syncScheduler.service');
 const SyncLog = require('../models/SyncLog');
 const BankConnection = require('../models/BankConnection');
+const ImportedTransactionMap = require('../models/ImportedTransactionMap');
+const Expense = require('../models/Expense');
+const Income = require('../models/Income');
 const AppError = require('../utils/AppError');
 const asyncHandler = require('../utils/asyncHandler');
 
@@ -20,7 +23,7 @@ const asyncHandler = require('../utils/asyncHandler');
  * @access  Private
  */
 const syncAllUserConnections = asyncHandler(async (req, res) => {
-  const userId = req.user._id;
+  const userId = req.user.userId;
 
   // Create initial sync logs for each connection
   const connections = await BankConnection.find({
@@ -60,7 +63,7 @@ const syncAllUserConnections = asyncHandler(async (req, res) => {
  */
 const syncConnection = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const userId = req.user._id;
+  const userId = req.user.userId;
 
   // Verify connection ownership
   const connection = await BankConnection.findOne({
@@ -109,11 +112,12 @@ const syncConnection = asyncHandler(async (req, res) => {
 
     const result = await syncScheduler.syncBankConnection(id, userId, {
       isInitialSync: false,
-      forceSync: true
+      forceSync: true,
+      syncLogId: syncLog._id,
     });
 
     await syncLog.markAsCompleted({
-      totalFetched: result.newTransactions + result.duplicates,
+      totalFetched: result.totalFetched ?? (result.newTransactions + result.duplicates),
       newTransactions: result.newTransactions,
       duplicates: result.duplicates,
       transfers: result.transfers
@@ -143,7 +147,7 @@ const syncConnection = asyncHandler(async (req, res) => {
  */
 const getSyncStatus = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const userId = req.user._id;
+  const userId = req.user.userId;
 
   const connection = await BankConnection.findOne({
     _id: id,
@@ -171,7 +175,7 @@ const getSyncStatus = asyncHandler(async (req, res) => {
       nextSyncAt: connection.nextSyncAt,
       autoSync: connection.autoSync,
       syncInterval: connection.syncInterval,
-      errorMessage: connection.errorMessage,
+      errorMessage: connection.lastSyncError,
       latestSync: latestSync ? {
         syncLogId: latestSync._id,
         status: latestSync.status,
@@ -192,7 +196,7 @@ const getSyncStatus = asyncHandler(async (req, res) => {
  * @query   page, limit, status, connectionId
  */
 const getSyncHistory = asyncHandler(async (req, res) => {
-  const userId = req.user._id;
+  const userId = req.user.userId;
   const {
     page = 1,
     limit = 20,
@@ -220,7 +224,7 @@ const getSyncHistory = asyncHandler(async (req, res) => {
  * @access  Private
  */
 const getSyncStatistics = asyncHandler(async (req, res) => {
-  const userId = req.user._id;
+  const userId = req.user.userId;
   const { days = 30 } = req.query;
 
   // Get user's connections
@@ -300,7 +304,7 @@ const getGlobalSyncStats = asyncHandler(async (req, res) => {
  * @access  Private
  */
 const retryFailedSyncs = asyncHandler(async (req, res) => {
-  const userId = req.user._id;
+  const userId = req.user.userId;
 
   // Get user's failed syncs that are retryable
   const failedLogs = await SyncLog.find({
@@ -375,7 +379,7 @@ const retryFailedSyncs = asyncHandler(async (req, res) => {
  */
 const cancelSync = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const userId = req.user._id;
+  const userId = req.user.userId;
 
   const connection = await BankConnection.findOne({
     _id: id,
@@ -430,7 +434,7 @@ const cancelSync = asyncHandler(async (req, res) => {
  */
 const updateSyncSettings = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const userId = req.user._id;
+  const userId = req.user.userId;
   const { autoSync, syncInterval } = req.body;
 
   const connection = await BankConnection.findOne({
@@ -476,6 +480,50 @@ const updateSyncSettings = asyncHandler(async (req, res) => {
   });
 });
 
+/**
+ * @desc    Clear transactions imported by a specific sync log
+ * @route   DELETE /api/v1/sync/history/:id/transactions
+ * @access  Private
+ */
+const clearSyncTransactions = asyncHandler(async (req, res) => {
+  const syncLogId = req.params.id;
+  const userId = req.user.userId;
+
+  const syncLog = await SyncLog.findOne({ _id: syncLogId, userId });
+  if (!syncLog) {
+    throw new AppError('Sync log not found', 404);
+  }
+
+  const mappings = await ImportedTransactionMap.find({
+    userId,
+    $or: [
+      { importJobId: syncLog._id },
+      { 'rawData.syncLogId': syncLog._id },
+      { 'rawData.syncLogId': String(syncLog._id) },
+    ],
+  });
+
+  const expenseIds = mappings.filter((m) => m.expenseId).map((m) => m.expenseId);
+  const incomeIds = mappings.filter((m) => m.incomeId).map((m) => m.incomeId);
+
+  await Promise.all([
+    expenseIds.length ? Expense.deleteMany({ _id: { $in: expenseIds }, userId }) : Promise.resolve(),
+    incomeIds.length ? Income.deleteMany({ _id: { $in: incomeIds }, userId }) : Promise.resolve(),
+    ImportedTransactionMap.deleteMany({ _id: { $in: mappings.map((m) => m._id) }, userId }),
+  ]);
+
+  res.json({
+    success: true,
+    message: 'Transactions for this sync were cleared',
+    data: {
+      syncLogId,
+      deletedExpenses: expenseIds.length,
+      deletedIncomes: incomeIds.length,
+      totalDeleted: expenseIds.length + incomeIds.length,
+    },
+  });
+});
+
 module.exports = {
   syncAllUserConnections,
   syncConnection,
@@ -485,5 +533,6 @@ module.exports = {
   getGlobalSyncStats,
   retryFailedSyncs,
   cancelSync,
-  updateSyncSettings
+  updateSyncSettings,
+  clearSyncTransactions,
 };

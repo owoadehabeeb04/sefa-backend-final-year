@@ -11,11 +11,153 @@ const MONO_BASE_URL = process.env.MONO_ENVIRONMENT === 'production'
 
 const MONO_SECRET_KEY = process.env.MONO_SECRET_KEY;
 
+const extractAccountIdFromAuthResponse = (payload) => {
+  if (!payload || typeof payload !== 'object') return null;
+
+  const candidates = [
+    payload.id,
+    payload.accountId,
+    payload.account?._id,
+    payload.account?.id,
+    payload.data?.id,
+    payload.data?.accountId,
+    payload.data?.account?._id,
+    payload.data?.account?.id,
+    payload.response?.id,
+    payload.response?.data?.id,
+  ];
+
+  const found = candidates.find((value) => typeof value === 'string' && value.trim().length > 0);
+  return found ? found.trim() : null;
+};
+
+const unwrapMonoData = (payload) => {
+  if (!payload || typeof payload !== 'object') return payload;
+  if (payload.data && typeof payload.data === 'object') return payload.data;
+  return payload;
+};
+
+const normalizeAccountDetails = (payload) => {
+  const root = unwrapMonoData(payload) || {};
+  const accountNode = root.account || root;
+  const institutionNode =
+    root.institution ||
+    root.institutionData ||
+    root.bank ||
+    accountNode.institution ||
+    accountNode.bank ||
+    root.meta?.institution ||
+    {};
+  const rawType = String(accountNode.type || accountNode.accountType || '').toLowerCase();
+
+  const firstNonEmpty = (...values) => {
+    for (const value of values) {
+      if (value === null || value === undefined) continue;
+      const str = String(value).trim();
+      if (str) return str;
+    }
+    return '';
+  };
+
+  const normalizedAccountNumber = firstNonEmpty(
+    accountNode.accountNumber,
+    accountNode.account_number,
+    accountNode.number,
+    accountNode.nuban,
+    accountNode.maskedAccountNumber,
+    accountNode.masked_account_number,
+    root.accountNumber,
+    root.account_number,
+    root.nuban,
+    root.maskedAccountNumber,
+    root.masked_account_number,
+  );
+
+  let normalizedAccountType = 'other';
+  if (rawType.includes('saving')) normalizedAccountType = 'savings';
+  else if (rawType.includes('current')) normalizedAccountType = 'current';
+  else if (rawType.includes('domiciliary')) normalizedAccountType = 'domiciliary';
+
+  return {
+    ...root,
+    account: {
+      ...accountNode,
+      name: accountNode.name || accountNode.accountName || accountNode.fullName || '',
+      accountNumber: normalizedAccountNumber,
+      type: normalizedAccountType,
+      currency: String(accountNode.currency || 'NGN').toUpperCase(),
+      balance: Number(accountNode.balance || 0),
+    },
+    institution: {
+      ...institutionNode,
+      name:
+        institutionNode.name ||
+        institutionNode.displayName ||
+        institutionNode.display_name ||
+        institutionNode.fullName ||
+        root.institutionName ||
+        root.bankName ||
+        accountNode.bankName ||
+        'Unknown Bank',
+      bankCode:
+        institutionNode.bankCode ||
+        institutionNode.code ||
+        institutionNode.id ||
+        root.institutionCode ||
+        root.bankCode ||
+        '',
+    },
+  };
+};
+
+const normalizeTransactionShape = (tx) => {
+  if (!tx || typeof tx !== 'object') return tx;
+  const transactionId = tx._id || tx.id || tx.transactionId || tx.reference || null;
+  return {
+    ...tx,
+    _id: transactionId,
+    id: tx.id || transactionId,
+    narration: tx.narration || tx.description || 'Bank transaction',
+    type: tx.type || tx.transactionType,
+    amount: Number(tx.amount || 0),
+    date: tx.date || tx.createdAt || tx.postedAt,
+  };
+};
+
+const formatMonoDate = (value) => {
+  if (!value) return null;
+
+  let date;
+  if (value instanceof Date) {
+    date = value;
+  } else {
+    const raw = String(value).trim();
+    if (!raw) return null;
+
+    if (/^\d{2}-\d{2}-\d{4}$/.test(raw)) {
+      return raw;
+    }
+
+    const normalizedIsoLike = raw.includes('T') ? raw : raw.replace(/-/g, '/');
+    date = new Date(normalizedIsoLike);
+  }
+
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  const day = String(date.getDate()).padStart(2, '0');
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const year = String(date.getFullYear());
+  return `${day}-${month}-${year}`;
+};
+
 // Axios instance with default config
 const monoClient = axios.create({
   baseURL: MONO_BASE_URL,
   headers: {
     'Content-Type': 'application/json',
+    'accept': 'application/json',
     'mono-sec-key': MONO_SECRET_KEY
   },
   timeout: 30000 // 30 seconds
@@ -55,9 +197,34 @@ monoClient.interceptors.response.use(
  */
 const exchangeToken = async (code) => {
   try {
-    const response = await monoClient.post('/account/auth', { code });
-    return response.data.id; // Account ID
+    const response = await monoClient.post('/v2/accounts/auth', { code });
+    const accountId = extractAccountIdFromAuthResponse(response.data);
+    if (accountId) return accountId;
+
+    console.error('❌ Mono auth payload missing account ID:', {
+      keys: Object.keys(response.data || {}),
+      hasData: Boolean(response.data?.data),
+      dataKeys: response.data?.data && typeof response.data.data === 'object'
+        ? Object.keys(response.data.data)
+        : [],
+    });
+
+    throw new Error('Mono auth succeeded but no account ID was returned');
   } catch (error) {
+    if (error.response?.status === 404) {
+      try {
+        const fallbackResponse = await monoClient.post('/accounts/auth', { code });
+        const fallbackAccountId = extractAccountIdFromAuthResponse(fallbackResponse.data);
+        if (fallbackAccountId) return fallbackAccountId;
+
+        throw new Error('Mono auth fallback succeeded but no account ID was returned');
+      } catch (fallbackError) {
+        throw new Error(
+          `Failed to exchange token: ${fallbackError.response?.data?.message || fallbackError.message}`,
+        );
+      }
+    }
+
     throw new Error(`Failed to exchange token: ${error.response?.data?.message || error.message}`);
   }
 };
@@ -69,9 +236,24 @@ const exchangeToken = async (code) => {
  */
 const getAccountDetails = async (accountId) => {
   try {
+    if (!accountId) {
+      throw new Error('Missing Mono account ID from token exchange');
+    }
+
     const response = await monoClient.get(`/accounts/${accountId}`);
-    return response.data;
+    return normalizeAccountDetails(response.data);
   } catch (error) {
+    if (error.response?.status === 404 && accountId) {
+      try {
+        const fallbackResponse = await monoClient.get(`/v2/accounts/${accountId}`);
+        return normalizeAccountDetails(fallbackResponse.data);
+      } catch (fallbackError) {
+        throw new Error(
+          `Failed to get account details: ${fallbackError.response?.data?.message || fallbackError.message}`,
+        );
+      }
+    }
+
     throw new Error(`Failed to get account details: ${error.response?.data?.message || error.message}`);
   }
 };
@@ -131,33 +313,57 @@ const fetchTransactions = async (accountId, options = {}) => {
     };
     
     if (start) {
-      params.start = start instanceof Date 
-        ? start.toISOString().split('T')[0] 
-        : start;
+      const formattedStart = formatMonoDate(start);
+      if (formattedStart) {
+        params.start = formattedStart;
+      }
     }
     
     if (end) {
-      params.end = end instanceof Date 
-        ? end.toISOString().split('T')[0] 
-        : end;
+      const formattedEnd = formatMonoDate(end);
+      if (formattedEnd) {
+        params.end = formattedEnd;
+      }
     }
     
     if (paginate) {
       params.paginate = paginate;
     }
     
-    const response = await monoClient.get(`/accounts/${accountId}/transactions`, {
-      params
-    });
-    
+    let response;
+    try {
+      response = await monoClient.get(`/accounts/${accountId}/transactions`, { params });
+    } catch (primaryError) {
+      if (primaryError.response?.status === 404) {
+        response = await monoClient.get(`/v2/accounts/${accountId}/transactions`, { params });
+      } else {
+        throw primaryError;
+      }
+    }
+
+    const body = response?.data || {};
+    const dataNode = unwrapMonoData(body) || {};
+    const rawTransactions = Array.isArray(body.data)
+      ? body.data
+      : Array.isArray(dataNode.transactions)
+        ? dataNode.transactions
+        : Array.isArray(dataNode.data)
+          ? dataNode.data
+          : [];
+    const transactions = rawTransactions.map(normalizeTransactionShape).filter((tx) => tx?._id);
+
     return {
-      transactions: response.data.data || [],
-      meta: response.data.meta || {},
-      paging: response.data.paging || {}
+      transactions,
+      meta: body.meta || dataNode.meta || {},
+      paging: body.paging || dataNode.paging || body.pagination || dataNode.pagination || {},
     };
   } catch (error) {
     throw new Error(`Failed to fetch transactions: ${error.response?.data?.message || error.message}`);
   }
+};
+
+const getTransactions = async (accountId, options = {}) => {
+  return fetchAllTransactions(accountId, options);
 };
 
 /**
@@ -277,18 +483,19 @@ const getInstitutions = async () => {
  * @returns {Object} Normalized transaction
  */
 const normalizeTransaction = (monoTransaction, userId) => {
-  const isCredit = monoTransaction.type === 'credit';
+  const normalizedInput = normalizeTransactionShape(monoTransaction);
+  const isCredit = normalizedInput.type === 'credit';
   
   return {
     userId,
-    amount: Math.abs(monoTransaction.amount),
-    description: monoTransaction.narration || 'No description',
-    date: new Date(monoTransaction.date),
-    externalId: monoTransaction._id,
+    amount: Math.abs(normalizedInput.amount),
+    description: normalizedInput.narration || 'No description',
+    date: new Date(normalizedInput.date),
+    externalId: normalizedInput._id,
     paymentMethod: 'bank_transfer',
-    source: isCredit ? (monoTransaction.narration || 'Bank Transfer') : undefined,
+    source: isCredit ? (normalizedInput.narration || 'Bank Transfer') : undefined,
     type: isCredit ? 'income' : 'expense',
-    rawData: monoTransaction
+    rawData: normalizedInput
   };
 };
 
@@ -299,6 +506,7 @@ module.exports = {
   getAccountStatement,
   fetchTransactions,
   fetchAllTransactions,
+  getTransactions,
   getAccountIncome,
   reauthorizeAccount,
   unlinkAccount,

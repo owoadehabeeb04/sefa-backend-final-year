@@ -137,7 +137,7 @@ const uploadToGridFS = async (req, res, next) => {
     
     const uploadStream = bucket.openUploadStream(filename, {
       metadata: {
-        userId: req.user.id,
+        userId: req.user.userId,
         originalName: req.file.originalname,
         mimeType: req.file.mimetype,
         size: req.file.size,

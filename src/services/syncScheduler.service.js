@@ -6,6 +6,7 @@ const aiCategorizationService = require('./aiCategorization.service');
 const Expense = require('../models/Expense');
 const Income = require('../models/Income');
 const ImportedTransactionMap = require('../models/ImportedTransactionMap');
+const Category = require('../models/Category');
 const { addNotificationJob } = require('../config/queue');
 const AppError = require('../utils/AppError');
 
@@ -75,7 +76,7 @@ const syncAllConnections = async (options = {}) => {
         
         // Update connection status to error
         connection.syncStatus = 'error';
-        connection.errorMessage = error.message;
+        connection.lastSyncError = error.message;
         await connection.save();
       }
     }
@@ -105,7 +106,7 @@ const syncAllConnections = async (options = {}) => {
  * @returns {Promise<Object>} Sync result
  */
 const syncBankConnection = async (connectionId, userId, options = {}) => {
-  const { isInitialSync = false, startDate, endDate } = options;
+  const { isInitialSync = false, startDate, endDate, syncLogId = null } = options;
 
   try {
     // Fetch connection
@@ -154,13 +155,14 @@ const syncBankConnection = async (connectionId, userId, options = {}) => {
       connection.syncStatus = 'active';
       connection.lastSyncAt = now;
       connection.nextSyncAt = calculateNextSync(connection.syncInterval);
-      connection.errorMessage = null;
+      connection.lastSyncError = null;
       connection.syncAttempts = 0;
       await connection.save();
 
       return {
         success: true,
         message: 'No new transactions',
+        totalFetched: transactions.length,
         newTransactions: 0,
         duplicates: 0,
         transfers: 0
@@ -179,13 +181,14 @@ const syncBankConnection = async (connectionId, userId, options = {}) => {
       connection.syncStatus = 'active';
       connection.lastSyncAt = now;
       connection.nextSyncAt = calculateNextSync(connection.syncInterval);
-      connection.errorMessage = null;
+      connection.lastSyncError = null;
       connection.syncAttempts = 0;
       await connection.save();
 
       return {
         success: true,
         message: 'All transactions already imported',
+        totalFetched: transactions.length,
         newTransactions: 0,
         duplicates: duplicates.length,
         transfers: 0
@@ -200,26 +203,30 @@ const syncBankConnection = async (connectionId, userId, options = {}) => {
       transferDetection,
       userId,
       connection._id,
-      connection.accountId
+      connection.accountId,
+      syncLogId
     );
 
     // Update connection sync status
     connection.syncStatus = 'active';
     connection.lastSyncAt = now;
     connection.nextSyncAt = calculateNextSync(connection.syncInterval);
-    connection.errorMessage = null;
+    connection.lastSyncError = null;
     connection.syncAttempts = 0;
     await connection.save();
 
-    // Queue notification if significant imports (>5 transactions)
-    if (savedCount >= 5) {
+    // Queue notification for any imported transactions
+    if (savedCount > 0) {
       await addNotificationJob({
         userId,
-        type: 'bank_sync',
+        type: 'import_complete',
+        urgency: 'instant',
         data: {
           institutionName: connection.institutionName,
           accountNumber: connection.accountNumber,
-          transactionCount: savedCount,
+          importedCount: savedCount,
+          duplicateCount: duplicates.length,
+          source: connection.institutionName || 'Bank Sync',
           syncDate: now
         }
       });
@@ -228,9 +235,12 @@ const syncBankConnection = async (connectionId, userId, options = {}) => {
     return {
       success: true,
       message: 'Sync completed successfully',
+      totalFetched: transactions.length,
       newTransactions: savedCount,
       duplicates: duplicates.length,
-      transfers: transferDetection.transfers.length,
+      transfers: Array.isArray(transferDetection?.transfers)
+        ? transferDetection.transfers.length
+        : (transferDetection?.pairCount || transferDetection?.pairs?.length || 0),
       connection: {
         institutionName: connection.institutionName,
         accountNumber: connection.accountNumber,
@@ -246,7 +256,7 @@ const syncBankConnection = async (connectionId, userId, options = {}) => {
       const connection = await BankConnection.findById(connectionId);
       if (connection) {
         connection.syncStatus = 'error';
-        connection.errorMessage = error.message;
+        connection.lastSyncError = error.message;
         
         // Implement exponential backoff for retry
         const baseInterval = connection.syncInterval || 12; // hours
@@ -277,11 +287,16 @@ const deduplicateTransactions = async (transactions, userId, connectionId) => {
   const duplicates = [];
 
   for (const transaction of transactions) {
+    const externalId = String(transaction?._id || transaction?.id || transaction?.reference || '').trim();
+    if (!externalId) {
+      duplicates.push(transaction);
+      continue;
+    }
+
     // Check if transaction already imported
     const existingMap = await ImportedTransactionMap.findOne({
       userId,
-      externalId: transaction._id,
-      source: 'mono'
+      externalId
     });
 
     if (existingMap) {
@@ -289,15 +304,27 @@ const deduplicateTransactions = async (transactions, userId, connectionId) => {
       continue;
     }
 
+    const [existingExpense, existingIncome] = await Promise.all([
+      Expense.exists({ userId, externalId }),
+      Income.exists({ userId, externalId }),
+    ]);
+
+    if (existingExpense || existingIncome) {
+      duplicates.push(transaction);
+      continue;
+    }
+
     // Check for duplicate by amount, date, description
-    const isDuplicate = await deduplicationService.findDuplicates({
+    const duplicateCheck = await deduplicationService.checkDuplicate({
       amount: Math.abs(transaction.amount),
       date: new Date(transaction.date),
       description: transaction.narration,
-      userId
+      userId,
+      type: transaction.type === 'debit' ? 'expense' : 'income',
+      externalId,
     });
 
-    if (isDuplicate.length > 0) {
+    if (duplicateCheck?.isDuplicate) {
       duplicates.push(transaction);
       continue;
     }
@@ -317,10 +344,33 @@ const deduplicateTransactions = async (transactions, userId, connectionId) => {
  * @param {String} accountId - Mono account ID
  * @returns {Promise<Number>} Count of saved transactions
  */
-const saveTransactions = async (transferDetection, userId, connectionId, accountId) => {
+const saveTransactions = async (transferDetection, userId, connectionId, accountId, syncLogId = null) => {
   let savedCount = 0;
+  const fallbackCategoryCache = {
+    expense: null,
+    income: null,
+  };
 
-  const { transactions, transfers, transferPairs } = transferDetection;
+  const getFallbackCategoryId = async (type) => {
+    if (fallbackCategoryCache[type]) return fallbackCategoryCache[type];
+
+    const category = await Category.findOne({ userId, type }).select('_id').lean();
+    fallbackCategoryCache[type] = category?._id || null;
+    return fallbackCategoryCache[type];
+  };
+
+  const transactions = Array.isArray(transferDetection?.transactions)
+    ? transferDetection.transactions
+    : [
+        ...(Array.isArray(transferDetection?.unmatchedDebits) ? transferDetection.unmatchedDebits : []),
+        ...(Array.isArray(transferDetection?.unmatchedCredits) ? transferDetection.unmatchedCredits : []),
+      ];
+  const transfers = Array.isArray(transferDetection?.transfers) ? transferDetection.transfers : [];
+  const transferPairs = Array.isArray(transferDetection?.transferPairs)
+    ? transferDetection.transferPairs
+    : Array.isArray(transferDetection?.pairs)
+      ? transferDetection.pairs
+      : [];
 
   for (const transaction of transactions) {
     try {
@@ -352,6 +402,15 @@ const saveTransactions = async (transferDetection, userId, connectionId, account
         console.error('AI categorization failed, using fallback:', categorizationError);
         // Fall back to default category if AI categorization fails
       }
+
+      if (!categoryId) {
+        categoryId = await getFallbackCategoryId(type);
+      }
+
+      if (!categoryId) {
+        console.warn(`Skipping transaction due to missing ${type} category for user ${userId}`);
+        continue;
+      }
       
       const transactionData = {
         userId,
@@ -359,9 +418,10 @@ const saveTransactions = async (transferDetection, userId, connectionId, account
         description: transaction.narration || 'Bank transaction',
         date: new Date(transaction.date),
         categoryId: categoryId, // Use AI-suggested category
-        source: 'mono',
-        sourceId: transaction._id,
-        paymentMethod: 'Bank Transfer',
+        importJobId: syncLogId || null,
+        isImported: true,
+        externalId: transaction._id,
+        paymentMethod: 'bank_transfer',
         metadata: {
           balance: transaction.balance,
           reference: transaction.reference,
@@ -390,23 +450,28 @@ const saveTransactions = async (transferDetection, userId, connectionId, account
         savedTransaction = await Income.create(transactionData);
       }
 
-      // Create imported transaction map
-      await ImportedTransactionMap.create({
-        userId,
-        transactionId: savedTransaction._id,
-        transactionType: transaction.type === 'debit' ? 'expense' : 'income',
-        externalId: transaction._id,
-        source: 'mono',
-        importJobId: null, // No import job for sync
-        connectionId,
-        importedAt: new Date(),
-        metadata: {
-          accountId,
-          institutionName: 'via sync'
-        }
-      });
-
       savedCount++;
+
+      // Best-effort map creation for audit/undo tooling compatibility.
+      try {
+        await ImportedTransactionMap.create({
+          importJobId: syncLogId || connectionId,
+          userId,
+          expenseId: transaction.type === 'debit' ? savedTransaction._id : null,
+          incomeId: transaction.type === 'debit' ? null : savedTransaction._id,
+          externalId: transaction._id,
+          rawData: {
+            source: 'mono_sync',
+            connectionId,
+            syncLogId: syncLogId || null,
+            accountId,
+            importedAt: new Date(),
+            transaction,
+          },
+        });
+      } catch (mappingError) {
+        console.warn('ImportedTransactionMap write skipped:', mappingError.message);
+      }
     } catch (error) {
       console.error('Error saving transaction:', error);
       // Continue with next transaction
@@ -416,34 +481,47 @@ const saveTransactions = async (transferDetection, userId, connectionId, account
   // Link transfer pairs
   for (const pair of transferPairs) {
     try {
+      const sourceExternalId = pair?.sourceId || pair?.debit?._id || pair?.debit?.reference;
+      const destinationExternalId = pair?.destinationId || pair?.credit?._id || pair?.credit?.reference;
+      if (!sourceExternalId || !destinationExternalId) {
+        continue;
+      }
+
       const sourceMap = await ImportedTransactionMap.findOne({
-        externalId: pair.sourceId,
+        externalId: sourceExternalId,
         userId
       });
       const destMap = await ImportedTransactionMap.findOne({
-        externalId: pair.destinationId,
+        externalId: destinationExternalId,
         userId
       });
 
       if (sourceMap && destMap) {
         // Link transactions
-        if (sourceMap.transactionType === 'expense') {
-          await Expense.findByIdAndUpdate(sourceMap.transactionId, {
-            linkedTransactionId: destMap.transactionId
+        const sourceExpenseId = sourceMap.expenseId || null;
+        const sourceIncomeId = sourceMap.incomeId || null;
+        const destExpenseId = destMap.expenseId || null;
+        const destIncomeId = destMap.incomeId || null;
+
+        if (sourceExpenseId) {
+          await Expense.findByIdAndUpdate(sourceExpenseId, {
+            transferPairId: destIncomeId || destExpenseId
           });
-        } else {
-          await Income.findByIdAndUpdate(sourceMap.transactionId, {
-            linkedTransactionId: destMap.transactionId
+        }
+        if (sourceIncomeId) {
+          await Income.findByIdAndUpdate(sourceIncomeId, {
+            transferPairId: destExpenseId || destIncomeId
           });
         }
 
-        if (destMap.transactionType === 'expense') {
-          await Expense.findByIdAndUpdate(destMap.transactionId, {
-            linkedTransactionId: sourceMap.transactionId
+        if (destExpenseId) {
+          await Expense.findByIdAndUpdate(destExpenseId, {
+            transferPairId: sourceIncomeId || sourceExpenseId
           });
-        } else {
-          await Income.findByIdAndUpdate(destMap.transactionId, {
-            linkedTransactionId: sourceMap.transactionId
+        }
+        if (destIncomeId) {
+          await Income.findByIdAndUpdate(destIncomeId, {
+            transferPairId: sourceExpenseId || sourceIncomeId
           });
         }
       }

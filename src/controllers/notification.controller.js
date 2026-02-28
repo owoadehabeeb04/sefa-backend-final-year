@@ -29,7 +29,8 @@ exports.getNotifications = async (req, res) => {
       Notification.countDocuments(filter),
       Notification.countDocuments({ userId, isRead: false }),
     ]);
-
+console.log(`Fetched notifications for user ${userId}: page ${page}, limit ${limit}, total ${total}, unread ${unreadCount}`);
+console.log('Sample notification:', notifications[0]);
     return successResponse(res, {
       notifications,
       summary: {
@@ -57,6 +58,7 @@ exports.getUnreadCount = async (req, res) => {
   try {
     const userId = req.user.userId;
     const count = await Notification.getUnreadCount(userId);
+    console.log(`User ${userId} has ${count} unread notifications`);
     return successResponse(res, { count });
   } catch (error) {
     console.error('Get unread count error:', error);
@@ -139,7 +141,7 @@ exports.getNotification = async (req, res) => {
         $set: { isRead: true, readAt: new Date() },
       });
     }
-
+    console.log(`Fetched notification ${req.params.id} for user ${userId}`);
     return successResponse(res, { notification });
   } catch (error) {
     console.error('Get notification error:', error);

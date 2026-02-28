@@ -54,7 +54,22 @@ const importJobSchema = new mongoose.Schema({
   },
   stage: {
     type: String,
-    enum: ['parsing', 'deduplicating', 'categorizing', 'saving', 'completed'],
+    enum: [
+      'download',
+      'parse',
+      'deduplicate_internal',
+      'deduplicate_database',
+      'detect_transfers',
+      'save',
+      'parsing',
+      'deduplicating',
+      'categorizing',
+      'saving',
+      'completed',
+      'fetch',
+      'normalize',
+      'deduplicate'
+    ],
     default: 'parsing'
   },
   progress: {

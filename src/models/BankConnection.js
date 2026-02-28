@@ -5,8 +5,7 @@ const bankConnectionSchema = new mongoose.Schema({
   userId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    required: [true, 'User ID is required'],
-    index: true
+    required: [true, 'User ID is required']
   },
   provider: {
     type: String,
@@ -81,7 +80,7 @@ const bankConnectionSchema = new mongoose.Schema({
   },
   syncStatus: {
     type: String,
-    enum: ['active', 'paused', 'error', 'disconnected'],
+    enum: ['active', 'syncing', 'paused', 'error', 'disconnected', 'reauth_required'],
     default: 'active'
   },
   lastSyncError: {
@@ -194,6 +193,17 @@ bankConnectionSchema.virtual('maskedAccountNumber').get(function() {
   if (length <= 4) return this.accountNumber;
   return '*'.repeat(length - 4) + this.accountNumber.slice(-4);
 });
+
+bankConnectionSchema.virtual('syncInterval')
+  .get(function() {
+    const frequencyMs = this.syncFrequency || 43200000;
+    return Math.max(1, Math.round(frequencyMs / (60 * 60 * 1000)));
+  })
+  .set(function(hours) {
+    const parsed = Number(hours);
+    if (!Number.isFinite(parsed)) return;
+    this.syncFrequency = Math.max(1, parsed) * 60 * 60 * 1000;
+  });
 
 // Ensure virtuals are included in JSON
 bankConnectionSchema.set('toJSON', { virtuals: true });

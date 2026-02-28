@@ -115,6 +115,25 @@ exports.createExpense = async (req, res, next) => {
     // Populate category details
     await expense.populate('categoryId', 'name icon color type');
 
+    try {
+      const { addNotificationJob } = require('../config/queue');
+      await addNotificationJob({
+        userId,
+        type: 'transaction_alert',
+        urgency: 'instant',
+        data: {
+          amount: expense.amount,
+          description: expense.description || 'New expense added',
+          category: expense.categoryId?.name || category.name,
+          transactionType: 'expense',
+          transactionId: expense._id.toString(),
+          date: expense.date
+        }
+      });
+    } catch (notificationError) {
+      console.warn('Failed to enqueue expense notification:', notificationError.message);
+    }
+
     return successResponse(
       res,
       { expense },

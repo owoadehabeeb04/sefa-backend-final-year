@@ -17,7 +17,22 @@ const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
  */
 const generateTransactionAdvice = async (transaction, context = {}) => {
   const { amount, description, category, type } = transaction;
-  const { monthlySpending, categorySpending, budgetLimit } = context;
+  const {
+    monthlySpending,
+    monthlyIncome,
+    categorySpending,
+    budgetLimit,
+    categoryBudgetLimit,
+    categoryBudgetSpent,
+    categoryBudgetRemaining,
+    categoryBudgetPercentage,
+    categoryBudgetStatus,
+    totalMonthlyBudgetLimit,
+    totalMonthlyBudgetSpent,
+    totalMonthlyBudgetRemaining,
+    totalMonthlyBudgetPercentage,
+    totalMonthlyBudgetStatus
+  } = context;
   
   const prompt = `You are a Nigerian financial advisor. A user just made a ${type} transaction.
 
@@ -28,8 +43,26 @@ Transaction:
 
 Context:
 - Monthly spending so far: ₦${monthlySpending?.toLocaleString() || 'N/A'}
+- Monthly income so far: ₦${monthlyIncome?.toLocaleString() || 'N/A'}
 - Spending in this category: ₦${categorySpending?.toLocaleString() || 'N/A'}
 - Monthly budget limit: ₦${budgetLimit?.toLocaleString() || 'N/A'}
+- Category budget limit: ₦${categoryBudgetLimit?.toLocaleString() || 'N/A'}
+- Category budget spent: ₦${categoryBudgetSpent?.toLocaleString() || 'N/A'}
+- Category budget remaining: ₦${categoryBudgetRemaining?.toLocaleString() || 'N/A'}
+- Category budget usage: ${categoryBudgetPercentage ?? 'N/A'}%
+- Category budget status from DB: ${categoryBudgetStatus || 'no_budget'}
+- Total monthly budget limit: ₦${totalMonthlyBudgetLimit?.toLocaleString() || 'N/A'}
+- Total monthly budget spent: ₦${totalMonthlyBudgetSpent?.toLocaleString() || 'N/A'}
+- Total monthly budget remaining: ₦${totalMonthlyBudgetRemaining?.toLocaleString() || 'N/A'}
+- Total monthly budget usage: ${totalMonthlyBudgetPercentage ?? 'N/A'}%
+- Total monthly budget status from DB: ${totalMonthlyBudgetStatus || 'no_budget'}
+
+Rules:
+- Use ONLY the DB context values above.
+- If status is "ok" or "no_budget", do NOT claim the user exceeded budget.
+- If status is "warning", advise caution and what to cut back on.
+- If status is "exceeded", clearly state by how much based on provided numbers.
+- Keep advice specific to this transaction and current month.
 
 Provide a brief, practical financial tip (max 2 sentences) in Nigerian English. Be friendly and encouraging.`;
 
@@ -42,16 +75,34 @@ Provide a brief, practical financial tip (max 2 sentences) in Nigerian English. 
  * @param {Object} spending - Spending data
  * @returns {Promise<string>} AI-generated advice
  */
-const generateBudgetWarningAdvice = async (budget, spending) => {
-  const { category, limit, period } = budget;
-  const { amount, percentage } = spending;
+const generateBudgetWarningAdvice = async (payload, context = {}) => {
+  const budgetData = payload?.budget || payload || {};
+  const verified = context?.verifiedBudget || {};
+
+  const category = verified.category || budgetData.category || payload?.category || 'General';
+  const limit = verified.limit ?? budgetData.limit ?? budgetData.amount ?? payload?.limit ?? 0;
+  const spent = verified.spent ?? budgetData.spent ?? budgetData.amount ?? payload?.spent ?? 0;
+  const percentage = verified.percentage ?? budgetData.percentage ?? payload?.percentage ?? 0;
+  const remaining = verified.remaining ?? budgetData.remaining ?? payload?.remaining ?? Math.max(Number(limit || 0) - Number(spent || 0), 0);
+  const overspent = verified.overspent ?? budgetData.overspent ?? payload?.overspent ?? Math.max(Number(spent || 0) - Number(limit || 0), 0);
+  const status = verified.status || (Number(percentage) >= 100 ? 'exceeded' : Number(percentage) >= 80 ? 'warning' : 'ok');
+  const period = budgetData.period || payload?.period || 'monthly';
   
   const prompt = `You are a Nigerian financial advisor. A user is approaching their budget limit.
 
 Budget:
 - Category: ${category}
 - Limit: ₦${limit.toLocaleString()} (${period})
-- Current spending: ₦${amount.toLocaleString()} (${percentage}%)
+- Current spending from DB: ₦${spent.toLocaleString()} (${percentage}%)
+- Remaining budget from DB: ₦${remaining.toLocaleString()}
+- Overspent from DB: ₦${overspent.toLocaleString()}
+- Budget status from DB: ${status}
+
+Rules:
+- Base advice ONLY on these DB values.
+- If status is "warning", focus on preventing overspending this month.
+- If status is "exceeded", include a realistic recovery action for the rest of the month.
+- Do not say "exceeded" when status is not exceeded.
 
 Provide practical advice to help them stay within budget (max 2 sentences). Be constructive, not judgmental.`;
 

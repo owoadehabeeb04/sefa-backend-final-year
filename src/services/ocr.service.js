@@ -8,17 +8,53 @@ const { parseDate, parseAmount } = require('./parsing.service');
  * Fallback: Google Cloud Vision
  */
 
-// Azure setup
-const azureEndpoint = process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT;
-const azureApiKey = process.env.AZURE_DOCUMENT_INTELLIGENCE_API_KEY;
+// Azure setup (support both legacy and new env variable names)
+const azureEndpoint = process.env.AZURE_DOCUMENT_ENDPOINT || process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT;
+const azureApiKey = process.env.AZURE_DOCUMENT_API_KEY || process.env.AZURE_DOCUMENT_INTELLIGENCE_API_KEY;
+const azureModelId = process.env.AZURE_DOCUMENT_MODEL_ID || 'prebuilt-layout';
 let azureClient = null;
 
-if (azureEndpoint && azureApiKey) {
+const isPlaceholderAzureEndpoint = azureEndpoint && (
+  azureEndpoint.includes('your-resource') ||
+  azureEndpoint.includes('example.com')
+);
+
+if (azureEndpoint && azureApiKey && !isPlaceholderAzureEndpoint) {
   azureClient = new DocumentAnalysisClient(
     azureEndpoint,
     new AzureKeyCredential(azureApiKey)
   );
+  console.log('✅ Azure OCR configured');
+} else if (isPlaceholderAzureEndpoint) {
+  console.warn('⚠️  Azure OCR endpoint appears to be a placeholder value; Azure OCR disabled.');
 }
+
+const getAzureConfigStatus = () => ({
+  hasEndpoint: !!azureEndpoint,
+  hasApiKey: !!azureApiKey,
+  isPlaceholderEndpoint: !!isPlaceholderAzureEndpoint,
+  modelId: azureModelId,
+  endpointHost: (() => {
+    if (!azureEndpoint) return null;
+    try {
+      return new URL(azureEndpoint).host;
+    } catch (_error) {
+      return 'invalid-endpoint-format';
+    }
+  })(),
+  enabled: !!azureClient
+});
+
+const getAzureErrorDetails = (error) => {
+  const responseError = error?.response?.parsedBody?.error || error?.response?.body?.error;
+  return {
+    message: error?.message || 'Unknown Azure OCR error',
+    name: error?.name || null,
+    code: error?.code || responseError?.code || null,
+    statusCode: error?.statusCode || error?.response?.status || null,
+    details: responseError?.message || null
+  };
+};
 
 // Google Cloud Vision setup
 let googleClient = null;
@@ -33,35 +69,39 @@ if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
  * @returns {Promise<Array>} Extracted transactions
  */
 const extractTransactionsFromScannedPDF = async (fileBuffer) => {
-  try {
-    // Try Azure first
-    if (azureClient) {
-      console.log('🔵 Using Azure Document Intelligence for OCR');
+  // Try Azure first
+  if (azureClient) {
+    console.log('🔵 Using Azure Document Intelligence for OCR');
+    try {
       return await extractWithAzure(fileBuffer);
-    }
-    
-    // Fallback to Google Cloud Vision
-    if (googleClient) {
-      console.log('🟡 Falling back to Google Cloud Vision for OCR');
-      return await extractWithGoogle(fileBuffer);
-    }
-    
-    throw new Error('No OCR service configured (Azure or Google)');
-  } catch (error) {
-    console.error('❌ OCR extraction failed:', error.message);
-    
-    // If Azure fails, try Google as fallback
-    if (azureClient && googleClient) {
-      console.log('🟡 Azure failed, trying Google Cloud Vision');
-      try {
-        return await extractWithGoogle(fileBuffer);
-      } catch (googleError) {
-        throw new Error(`Both OCR services failed: ${error.message}; ${googleError.message}`);
+    } catch (azureError) {
+      const azureErrorDetails = getAzureErrorDetails(azureError);
+      console.error('❌ Azure OCR failed with details:', azureErrorDetails);
+
+      if (googleClient) {
+        console.log('🟡 Azure failed, trying Google Cloud Vision');
+        try {
+          return await extractWithGoogle(fileBuffer);
+        } catch (googleError) {
+          throw new Error(`Both OCR services failed: Azure=${azureErrorDetails.message}; Google=${googleError.message}`);
+        }
       }
+
+      throw new Error(`Azure OCR failed: ${azureErrorDetails.message}`);
     }
-    
-    throw error;
   }
+
+  // Fallback to Google Cloud Vision when Azure is not enabled
+  if (!azureClient) {
+    console.warn('⚠️  Azure OCR is not enabled. Config status:', getAzureConfigStatus());
+  }
+
+  if (googleClient) {
+    console.log('🟡 Falling back to Google Cloud Vision for OCR');
+    return await extractWithGoogle(fileBuffer);
+  }
+
+  throw new Error('No OCR service configured (Azure or Google)');
 };
 
 /**
@@ -70,44 +110,40 @@ const extractTransactionsFromScannedPDF = async (fileBuffer) => {
  * @returns {Promise<Array>} Extracted transactions
  */
 const extractWithAzure = async (fileBuffer) => {
-  try {
-    const poller = await azureClient.beginAnalyzeDocument(
-      'prebuilt-document',
-      fileBuffer
-    );
+  const poller = await azureClient.beginAnalyzeDocument(
+    azureModelId,
+    fileBuffer
+  );
+  
+  const { tables, keyValuePairs, content } = await poller.pollUntilDone();
+  
+  const transactions = [];
+  
+  // Strategy 1: Extract from tables
+  if (tables && tables.length > 0) {
+    console.log(`📊 Found ${tables.length} table(s) in document`);
     
-    const { tables, keyValuePairs, content } = await poller.pollUntilDone();
-    
-    const transactions = [];
-    
-    // Strategy 1: Extract from tables
-    if (tables && tables.length > 0) {
-      console.log(`📊 Found ${tables.length} table(s) in document`);
-      
-      for (const table of tables) {
-        const tableTransactions = extractTransactionsFromTable(table);
-        transactions.push(...tableTransactions);
-      }
+    for (const table of tables) {
+      const tableTransactions = extractTransactionsFromTable(table);
+      transactions.push(...tableTransactions);
     }
-    
-    // Strategy 2: Extract from key-value pairs
-    if (keyValuePairs && keyValuePairs.length > 0 && transactions.length === 0) {
-      console.log(`🔑 Found ${keyValuePairs.length} key-value pairs`);
-      // This would require more sophisticated parsing
-    }
-    
-    // Strategy 3: Parse raw content as fallback
-    if (content && transactions.length === 0) {
-      console.log('📝 Parsing raw content');
-      const contentTransactions = parseContentForTransactions(content);
-      transactions.push(...contentTransactions);
-    }
-    
-    console.log(`✅ Azure extracted ${transactions.length} transactions`);
-    return transactions;
-  } catch (error) {
-    throw new Error(`Azure OCR failed: ${error.message}`);
   }
+
+  // Strategy 2: Extract from key-value pairs
+  if (keyValuePairs && keyValuePairs.length > 0 && transactions.length === 0) {
+    console.log(`🔑 Found ${keyValuePairs.length} key-value pairs`);
+    // This would require more sophisticated parsing
+  }
+
+  // Strategy 3: Parse raw content as fallback
+  if (content && transactions.length === 0) {
+    console.log('📝 Parsing raw content');
+    const contentTransactions = parseContentForTransactions(content);
+    transactions.push(...contentTransactions);
+  }
+
+  console.log(`✅ Azure extracted ${transactions.length} transactions`);
+  return transactions;
 };
 
 /**
@@ -226,15 +262,9 @@ const parseContentForTransactions = (content) => {
  */
 const extractWithGoogle = async (fileBuffer) => {
   try {
-    const request = {
-      image: { content: fileBuffer.toString('base64') },
-      features: [
-        { type: 'DOCUMENT_TEXT_DETECTION' },
-        { type: 'TEXT_DETECTION' }
-      ]
-    };
-    
-    const [result] = await googleClient.documentTextDetection(request);
+    const [result] = await googleClient.documentTextDetection({
+      image: { content: fileBuffer.toString('base64') }
+    });
     const fullTextAnnotation = result.fullTextAnnotation;
     
     if (!fullTextAnnotation || !fullTextAnnotation.text) {

@@ -101,18 +101,24 @@ const processSyncJob = async (job) => {
       
       importJob.status = 'completed';
       importJob.progress = 100;
-      importJob.results = {
-        totalTransactions: 0,
-        importedCount: 0,
-        duplicateCount: 0,
-        errorCount: 0
-      };
+      importJob.stage = 'completed';
+      importJob.completedAt = new Date();
+      importJob.totalTransactions = 0;
+      importJob.importedCount = 0;
+      importJob.duplicateCount = 0;
+      importJob.errorCount = 0;
+      importJob.errors = [];
       await importJob.save();
       
       return {
         success: true,
         importJobId: importJob._id,
-        results: importJob.results
+        results: {
+          totalTransactions: importJob.totalTransactions,
+          importedCount: importJob.importedCount,
+          duplicateCount: importJob.duplicateCount,
+          errorCount: importJob.errorCount
+        }
       };
     }
     
@@ -147,18 +153,24 @@ const processSyncJob = async (job) => {
       
       importJob.status = 'completed';
       importJob.progress = 100;
-      importJob.results = {
-        totalTransactions: monoTransactions.length,
-        importedCount: 0,
-        duplicateCount: duplicationCheck.duplicateCount,
-        errorCount: 0
-      };
+      importJob.stage = 'completed';
+      importJob.completedAt = new Date();
+      importJob.totalTransactions = monoTransactions.length;
+      importJob.importedCount = 0;
+      importJob.duplicateCount = duplicationCheck.duplicateCount;
+      importJob.errorCount = 0;
+      importJob.errors = [];
       await importJob.save();
       
       return {
         success: true,
         importJobId: importJob._id,
-        results: importJob.results
+        results: {
+          totalTransactions: importJob.totalTransactions,
+          importedCount: importJob.importedCount,
+          duplicateCount: importJob.duplicateCount,
+          errorCount: importJob.errorCount
+        }
       };
     }
     
@@ -192,22 +204,20 @@ const processSyncJob = async (job) => {
     // Step 7: Update job status
     importJob.status = 'completed';
     importJob.progress = 100;
-    importJob.results = {
-      totalTransactions: monoTransactions.length,
-      importedCount: saveResult.totalCount,
-      duplicateCount: duplicationCheck.duplicateCount,
-      errorCount: 0,
-      transferPairCount: transferDetection.pairCount,
-      expenseCount: saveResult.expenseCount,
-      incomeCount: saveResult.incomeCount
-    };
+    importJob.stage = 'completed';
+    importJob.completedAt = new Date();
+    importJob.totalTransactions = monoTransactions.length;
+    importJob.importedCount = saveResult.totalCount;
+    importJob.duplicateCount = duplicationCheck.duplicateCount;
+    importJob.errorCount = 0;
+    importJob.errors = [];
     await importJob.save();
     job.progress(100);
     
     console.log('✅ Sync completed successfully');
     
-    // Send notification for significant imports (>5 transactions)
-    if (saveResult.totalCount > 5) {
+    // Send notification for any imported transactions
+    if (saveResult.totalCount > 0) {
       await addNotificationJob({
         userId,
         type: 'import_complete',
@@ -215,8 +225,8 @@ const processSyncJob = async (job) => {
         data: {
           importJobId: importJob._id.toString(),
           source: 'Bank Sync',
-          importedCount: importJob.results.importedCount,
-          duplicateCount: importJob.results.duplicateCount
+          importedCount: importJob.importedCount,
+          duplicateCount: importJob.duplicateCount
         }
       });
     }
@@ -224,7 +234,12 @@ const processSyncJob = async (job) => {
     return {
       success: true,
       importJobId: importJob._id,
-      results: importJob.results
+      results: {
+        totalTransactions: importJob.totalTransactions,
+        importedCount: importJob.importedCount,
+        duplicateCount: importJob.duplicateCount,
+        errorCount: importJob.errorCount
+      }
     };
     
   } catch (error) {
@@ -254,13 +269,13 @@ const processSyncJob = async (job) => {
     // Update job status
     if (importJob) {
       importJob.status = 'failed';
-      importJob.errorMessage = error.message;
-      importJob.results = {
-        totalTransactions: 0,
-        importedCount: 0,
-        duplicateCount: 0,
-        errorCount: 1
-      };
+      importJob.stage = 'completed';
+      importJob.completedAt = new Date();
+      importJob.totalTransactions = 0;
+      importJob.importedCount = 0;
+      importJob.duplicateCount = 0;
+      importJob.errorCount = 1;
+      importJob.errors = [error.message];
       await importJob.save();
     }
     

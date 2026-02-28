@@ -38,8 +38,8 @@ exports.validateBudget = async (req, res, next) => {
         throw new AppError('Budget amount must be a positive number', 400);
       }
 
-      if (amount > 100000000) { // 100 million max
-        throw new AppError('Budget amount is too large (max: ₦100,000,000)', 400);
+      if (amount > 50000000) { // 50 million max
+        throw new AppError('Budget amount is too large (max: ₦50,000,000)', 400);
       }
     }
 

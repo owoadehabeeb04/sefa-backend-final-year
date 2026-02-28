@@ -1,6 +1,8 @@
+const mongoose = require('mongoose');
 const BankConnection = require('../models/BankConnection');
 const ImportJob = require('../models/ImportJob');
 const ImportedTransactionMap = require('../models/ImportedTransactionMap');
+const SyncLog = require('../models/SyncLog');
 const Expense = require('../models/Expense');
 const Income = require('../models/Income');
 
@@ -10,7 +12,7 @@ const ocrService = require('../services/ocr.service');
 const deduplicationService = require('../services/deduplication.service');
 const transferService = require('../services/transfer.service');
 
-const { addImportJob, addSyncJob } = require('../config/queue');
+const { addImportJob, addSyncJob, getJobStatus } = require('../config/queue');
 const { downloadFromGridFS } = require('../config/gridfs');
 
 /**
@@ -20,7 +22,7 @@ const { downloadFromGridFS } = require('../config/gridfs');
 const connectBankAccount = async (req, res) => {
   try {
     const { code } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.userId;
     
     if (!code) {
       return res.status(400).json({
@@ -54,8 +56,12 @@ const connectBankAccount = async (req, res) => {
       provider: 'mono',
       accountId,
       institutionName: accountDetails.institution?.name || 'Unknown Bank',
+      institutionCode: accountDetails.institution?.bankCode || '',
       accountName: accountDetails.account?.name || '',
       accountNumber: accountDetails.account?.accountNumber || '',
+      accountType: accountDetails.account?.type || 'savings',
+      currency: accountDetails.account?.currency || 'NGN',
+      balance: Number(accountDetails.account?.balance || 0),
       authCode: code, // Will be encrypted by pre-save hook
       accessToken: accountId,
       syncStatus: 'active'
@@ -96,12 +102,40 @@ const connectBankAccount = async (req, res) => {
  */
 const getBankConnections = async (req, res) => {
   try {
-    const userId = req.user.id;
-    
+    const userId = req.user.userId;
+
     const connections = await BankConnection.find({
       userId,
       isActive: true
     }).select('-authCode -accessToken').sort({ createdAt: -1 });
+
+    await Promise.all(
+      connections.map(async (connection) => {
+        const needsRefresh =
+          !connection.institutionName ||
+          connection.institutionName === 'Unknown Bank' ||
+          !connection.accountNumber ||
+          connection.accountNumber === 'N/A';
+
+        if (!needsRefresh || !connection.accountId) return;
+
+        try {
+          const details = await monoService.getAccountDetails(connection.accountId);
+          connection.institutionName = details.institution?.name || connection.institutionName || 'Unknown Bank';
+          connection.institutionCode = details.institution?.bankCode || connection.institutionCode || '';
+          connection.accountName = details.account?.name || connection.accountName || '';
+          connection.accountNumber = details.account?.accountNumber || connection.accountNumber || '';
+          connection.accountType = details.account?.type || connection.accountType || 'savings';
+          connection.currency = details.account?.currency || connection.currency || 'NGN';
+          if (typeof details.account?.balance === 'number') {
+            connection.balance = details.account.balance;
+          }
+          await connection.save();
+        } catch (refreshError) {
+          console.warn('⚠️ Failed to refresh bank connection details:', refreshError.message);
+        }
+      })
+    );
     
     res.json({
       success: true,
@@ -125,7 +159,7 @@ const getBankConnections = async (req, res) => {
 const getBankConnection = async (req, res) => {
   try {
     const { id } = req.params;
-    const userId = req.user.id;
+    const userId = req.user.userId;
     
     const connection = await BankConnection.findOne({
       _id: id,
@@ -161,7 +195,7 @@ const getBankConnection = async (req, res) => {
 const syncBankTransactions = async (req, res) => {
   try {
     const { id } = req.params;
-    const userId = req.user.id;
+    const userId = req.user.userId;
     
     const connection = await BankConnection.findOne({
       _id: id,
@@ -209,7 +243,7 @@ const syncBankTransactions = async (req, res) => {
 const disconnectBankAccount = async (req, res) => {
   try {
     const { id } = req.params;
-    const userId = req.user.id;
+    const userId = req.user.userId;
     
     const connection = await BankConnection.findOne({
       _id: id,
@@ -230,6 +264,39 @@ const disconnectBankAccount = async (req, res) => {
     } catch (error) {
       console.warn('⚠️  Failed to unlink from Mono:', error.message);
     }
+
+    // Delete transactions imported via this bank connection
+    const syncLogs = await SyncLog.find({
+      userId,
+      connectionId: connection._id,
+    }).select('_id').lean();
+    const syncLogIds = syncLogs.map((log) => log._id);
+
+    const mappings = await ImportedTransactionMap.find({
+      userId,
+      $or: [
+        { 'rawData.connectionId': connection._id },
+        { 'rawData.connectionId': String(connection._id) },
+        { 'rawData.accountId': connection.accountId },
+        ...(syncLogIds.length ? [{ importJobId: { $in: syncLogIds } }] : []),
+      ],
+    });
+
+    const expenseIds = mappings.filter((m) => m.expenseId).map((m) => m.expenseId);
+    const incomeIds = mappings.filter((m) => m.incomeId).map((m) => m.incomeId);
+    const mappedExternalIds = mappings
+      .map((m) => m.externalId)
+      .filter((value) => typeof value === 'string' && value.trim().length > 0);
+
+    await Promise.all([
+      expenseIds.length ? Expense.deleteMany({ _id: { $in: expenseIds }, userId }) : Promise.resolve(),
+      incomeIds.length ? Income.deleteMany({ _id: { $in: incomeIds }, userId }) : Promise.resolve(),
+      syncLogIds.length ? Expense.deleteMany({ importJobId: { $in: syncLogIds }, userId }) : Promise.resolve(),
+      syncLogIds.length ? Income.deleteMany({ importJobId: { $in: syncLogIds }, userId }) : Promise.resolve(),
+      mappedExternalIds.length ? Expense.deleteMany({ externalId: { $in: mappedExternalIds }, userId }) : Promise.resolve(),
+      mappedExternalIds.length ? Income.deleteMany({ externalId: { $in: mappedExternalIds }, userId }) : Promise.resolve(),
+      mappings.length ? ImportedTransactionMap.deleteMany({ _id: { $in: mappings.map((m) => m._id) } }) : Promise.resolve(),
+    ]);
     
     // Soft delete
     connection.isActive = false;
@@ -238,7 +305,12 @@ const disconnectBankAccount = async (req, res) => {
     
     res.json({
       success: true,
-      message: 'Bank account disconnected successfully'
+      message: 'Bank account disconnected and synced transactions removed successfully',
+      data: {
+        deletedExpenses: expenseIds.length,
+        deletedIncomes: incomeIds.length,
+        totalDeleted: expenseIds.length + incomeIds.length,
+      }
     });
   } catch (error) {
     console.error('❌ Disconnect bank account error:', error);
@@ -256,7 +328,7 @@ const disconnectBankAccount = async (req, res) => {
  */
 const uploadBankStatement = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user.userId;
     const fileId = req.fileId;
     const fileMetadata = req.fileMetadata;
     
@@ -307,23 +379,100 @@ const uploadBankStatement = async (req, res) => {
 const getImportJobStatus = async (req, res) => {
   try {
     const { jobId } = req.params;
-    const userId = req.user.id;
-    
-    const job = await ImportJob.findOne({
-      _id: jobId,
-      userId
-    });
-    
-    if (!job) {
+    const userId = req.user.userId;
+
+    // If it's a Mongo ObjectId, fetch import document directly
+    if (mongoose.isValidObjectId(jobId)) {
+      const job = await ImportJob.findOne({
+        _id: jobId,
+        userId
+      });
+
+      if (!job) {
+        return res.status(404).json({
+          success: false,
+          message: 'Import job not found'
+        });
+      }
+
+      return res.json({
+        success: true,
+        data: job
+      });
+    }
+
+    // Otherwise treat as queue job id (Bull uses numeric/string ids like "4")
+    const queueJob = await getJobStatus('import', jobId);
+
+    if (!queueJob) {
+      console.log(`Import job with queue ID ${jobId} not found`);
+      return res.status(404).json({
+
+        success: false,
+        message: 'Import job not found'
+      });
+    }
+
+    if (String(queueJob.data?.userId) !== String(userId)) {
       return res.status(404).json({
         success: false,
         message: 'Import job not found'
       });
     }
-    
-    res.json({
+
+    let importJob = null;
+    const importJobId = queueJob.returnvalue?.importJobId;
+
+    if (importJobId && mongoose.isValidObjectId(importJobId)) {
+      importJob = await ImportJob.findOne({ _id: importJobId, userId });
+    }
+
+    if (!importJob && queueJob.data?.fileId) {
+      importJob = await ImportJob.findOne({
+        userId,
+        fileId: queueJob.data.fileId
+      }).sort({ createdAt: -1 });
+    }
+
+    if (importJob) {
+      return res.json({
+        success: true,
+        data: importJob,
+        queue: {
+          id: queueJob.id,
+          state: queueJob.state,
+          progress: queueJob.progress,
+          attemptsMade: queueJob.attemptsMade,
+          failedReason: queueJob.failedReason
+        }
+      });
+    }
+
+    const statusFromQueue = {
+      waiting: 'pending',
+      active: 'processing',
+      completed: 'completed',
+      failed: 'failed',
+      delayed: 'pending'
+    };
+
+    return res.json({
       success: true,
-      data: job
+      data: {
+        status: statusFromQueue[queueJob.state] || 'pending',
+        stage: queueJob.state,
+        progress: Number(queueJob.progress || 0),
+        fileName: queueJob.data?.fileName || null,
+        errorCount: queueJob.failedReason ? 1 : 0,
+        errors: queueJob.failedReason ? [queueJob.failedReason] : []
+      },
+      queue: {
+        id: queueJob.id,
+        state: queueJob.state,
+        progress: queueJob.progress,
+        attemptsMade: queueJob.attemptsMade,
+        failedReason: queueJob.failedReason
+      }
     });
   } catch (error) {
     console.error('❌ Get job status error:', error);
@@ -341,7 +490,7 @@ const getImportJobStatus = async (req, res) => {
  */
 const getImportHistory = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user.userId;
     const { page = 1, limit = 20 } = req.query;
     
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -381,7 +530,7 @@ const getImportHistory = async (req, res) => {
 const undoImport = async (req, res) => {
   try {
     const { jobId } = req.params;
-    const userId = req.user.id;
+    const userId = req.user.userId;
     
     const job = await ImportJob.findOne({
       _id: jobId,
@@ -490,7 +639,14 @@ const handleMonoWebhook = async (req, res) => {
         // Refresh account details
         const details = await monoService.getAccountDetails(accountId);
         connection.institutionName = details.institution?.name || connection.institutionName;
+        connection.institutionCode = details.institution?.bankCode || connection.institutionCode;
         connection.accountName = details.account?.name || connection.accountName;
+        connection.accountNumber = details.account?.accountNumber || connection.accountNumber;
+        connection.accountType = details.account?.type || connection.accountType;
+        connection.currency = details.account?.currency || connection.currency;
+        if (typeof details.account?.balance === 'number') {
+          connection.balance = details.account.balance;
+        }
         await connection.save();
         break;
     }
