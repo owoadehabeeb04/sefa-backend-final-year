@@ -5,8 +5,7 @@ const notificationPreferencesSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
     required: [true, 'User ID is required'],
-    unique: true,
-    index: true
+    unique: true
   },
 
   // Push notification settings

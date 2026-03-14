@@ -348,7 +348,7 @@ syncLogSchema.statics.getLogsForRetry = async function() {
   return this.find({
     status: 'failed',
     'error.retryable': true,
-    retryCount: { $lt: this.schema.path('maxRetries').default },
+    retryCount: { $lt: 3 },
     nextRetryAt: { $lte: new Date() }
   }).populate('connectionId');
 };
