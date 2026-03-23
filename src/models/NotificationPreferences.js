@@ -154,9 +154,6 @@ const notificationPreferencesSchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Index for efficient queries
-notificationPreferencesSchema.index({ userId: 1 }, { unique: true });
-
 // Virtual for weekly summary day name
 notificationPreferencesSchema.virtual('weeklySummaryDayName').get(function() {
   const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];

@@ -103,16 +103,9 @@ const {
  *                   properties:
  *                     user:
  *                       $ref: '#/components/schemas/User'
- *                     token:
- *                       type: string
- *                     refreshToken:
- *                       type: string
- *                     otp:
- *                       type: string
- *                       description: Only returned in development mode
  *                     expiresIn:
  *                       type: string
- *                       description: Only returned in development mode
+ *                       description: OTP validity period
  *                 message:
  *                   type: string
  *       409:
@@ -427,12 +420,9 @@ router.post('/verify-email', validateVerifyEmail, authController.verifyEmail);
  *                   properties:
  *                     message:
  *                       type: string
- *                     otp:
- *                       type: string
- *                       description: Only returned in development mode
  *                     expiresIn:
  *                       type: string
- *                       description: Only returned in development mode
+ *                       description: OTP validity period
  *                 message:
  *                   type: string
  *       422:
@@ -480,5 +470,3 @@ router.post('/resend-otp', validateResendOTP, authController.resendOTP);
 router.post('/refresh-token', validateRefreshToken, authController.refreshToken);
 
 module.exports = router;
-
-

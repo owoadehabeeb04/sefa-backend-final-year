@@ -4,6 +4,10 @@ const anomalyDetectionService = require('../services/anomalyDetection.service');
 const budgetRecommendationService = require('../services/budgetRecommendation.service');
 const savingsSuggestionService = require('../services/savingsSuggestion.service');
 const aiCategorizationService = require('../services/aiCategorization.service');
+const insightHubService = require('../services/insights/insightHub.service');
+const forecastService = require('../services/insights/forecast.service');
+const healthScoreService = require('../services/insights/healthScore.service');
+const copilotService = require('../services/insights/copilot.service');
 
 /**
  * @swagger
@@ -124,6 +128,96 @@ exports.getSavingsSuggestions = async (req, res) => {
   } catch (error) {
     console.error('Get savings suggestions error:', error);
     return errorResponse(res, 'Failed to generate savings suggestions', 500);
+  }
+};
+
+exports.getInsightsHub = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const months = parseInt(req.query.months, 10) || 3;
+    const days = parseInt(req.query.days, 10) === 7 ? 7 : 30;
+
+    if (months < 1 || months > 12) {
+      return errorResponse(res, 'Months must be between 1 and 12', 400);
+    }
+
+    const hub = await insightHubService.buildInsightsHub(userId, { months, days });
+    return successResponse(res, hub, 'Insights hub generated successfully');
+  } catch (error) {
+    console.error('Get insights hub error:', error);
+    return errorResponse(res, 'Failed to generate insights hub', 500);
+  }
+};
+
+exports.getHealthScore = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const score = await healthScoreService.generateHealthScore(userId, { days: 90 });
+    return successResponse(res, score, 'Health score generated successfully');
+  } catch (error) {
+    console.error('Get health score error:', error);
+    return errorResponse(res, 'Failed to generate health score', 500);
+  }
+};
+
+exports.getForecast = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const days = parseInt(req.query.days, 10) === 7 ? 7 : 30;
+    const forecast = await forecastService.generateForecast(userId, { days });
+    return successResponse(res, forecast, 'Forecast generated successfully');
+  } catch (error) {
+    console.error('Get forecast error:', error);
+    return errorResponse(res, 'Failed to generate forecast', 500);
+  }
+};
+
+exports.runWhatIfScenario = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const scenario = await insightHubService.runWhatIfScenario(userId, req.body || {});
+    return successResponse(res, scenario, 'Scenario simulated successfully');
+  } catch (error) {
+    console.error('Run what-if scenario error:', error);
+    return errorResponse(res, 'Failed to simulate scenario', 500);
+  }
+};
+
+exports.chatWithCopilot = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const question = String(req.body?.question || '').trim();
+
+    if (!question) {
+      return errorResponse(res, 'Question is required', 400);
+    }
+
+    const answer = await copilotService.answerInsightQuestion(userId, question, {
+      months: parseInt(req.body?.months, 10) || 3,
+      days: parseInt(req.body?.days, 10) === 7 ? 7 : 30,
+    });
+
+    return successResponse(res, answer, 'Copilot response generated successfully');
+  } catch (error) {
+    console.error('Copilot chat error:', error);
+    return errorResponse(res, 'Failed to generate copilot response', 500);
+  }
+};
+
+exports.submitFeedback = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const { insightKey, insightType, rating } = req.body || {};
+
+    if (!insightKey || !insightType || !rating) {
+      return errorResponse(res, 'insightKey, insightType, and rating are required', 400);
+    }
+
+    const feedback = await insightHubService.submitInsightFeedback(userId, req.body);
+    return successResponse(res, feedback, 'Insight feedback recorded successfully', 201);
+  } catch (error) {
+    console.error('Submit insight feedback error:', error);
+    return errorResponse(res, 'Failed to record insight feedback', 500);
   }
 };
 

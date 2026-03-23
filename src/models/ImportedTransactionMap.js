@@ -4,7 +4,13 @@ const importedTransactionMapSchema = new mongoose.Schema({
   importJobId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'ImportJob',
-    required: [true, 'Import Job ID is required'],
+    default: null,
+    index: true
+  },
+  syncLogId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'SyncLog',
+    default: null,
     index: true
   },
   userId: {
@@ -12,6 +18,21 @@ const importedTransactionMapSchema = new mongoose.Schema({
     ref: 'User',
     required: [true, 'User ID is required'],
     index: true
+  },
+  sourceType: {
+    type: String,
+    enum: ['bank_connection', 'import_job'],
+    default: null,
+    index: true
+  },
+  sourceRefId: {
+    type: mongoose.Schema.Types.ObjectId,
+    default: null,
+    index: true
+  },
+  provider: {
+    type: String,
+    default: null
   },
 
   // Transaction links (one or the other, not both)
@@ -44,9 +65,30 @@ const importedTransactionMapSchema = new mongoose.Schema({
 
 // Compound indexes for efficient queries
 importedTransactionMapSchema.index({ importJobId: 1, userId: 1 });
-importedTransactionMapSchema.index({ userId: 1, externalId: 1 }, { unique: true, sparse: true });
-importedTransactionMapSchema.index({ expenseId: 1 }, { sparse: true });
-importedTransactionMapSchema.index({ incomeId: 1 }, { sparse: true });
+importedTransactionMapSchema.index({ syncLogId: 1, userId: 1 });
+importedTransactionMapSchema.index(
+  { userId: 1, sourceType: 1, sourceRefId: 1, externalId: 1 },
+  {
+    unique: true,
+    sparse: true,
+    partialFilterExpression: {
+      sourceType: { $type: 'string' },
+      sourceRefId: { $exists: true, $ne: null },
+      externalId: { $type: 'string' },
+    },
+  },
+);
+importedTransactionMapSchema.index(
+  { userId: 1, externalId: 1 },
+  {
+    unique: true,
+    sparse: true,
+    partialFilterExpression: {
+      sourceType: null,
+      externalId: { $type: 'string' },
+    },
+  },
+);
 
 // Validation: ensure either expenseId or incomeId is set, not both
 importedTransactionMapSchema.pre('save', function(next) {
@@ -108,9 +150,14 @@ importedTransactionMapSchema.statics.deleteByImportJob = async function(importJo
 };
 
 // Static method to check if external ID already exists
-importedTransactionMapSchema.statics.existsByExternalId = async function(userId, externalId) {
+importedTransactionMapSchema.statics.existsByExternalId = async function(userId, externalId, options = {}) {
   if (!externalId) return false;
-  const count = await this.countDocuments({ userId, externalId });
+  const query = { userId, externalId };
+
+  if (options.sourceType) query.sourceType = options.sourceType;
+  if (options.sourceRefId) query.sourceRefId = options.sourceRefId;
+
+  const count = await this.countDocuments(query);
   return count > 0;
 };
 

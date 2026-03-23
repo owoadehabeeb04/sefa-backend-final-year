@@ -1,4 +1,8 @@
 const { body, validationResult } = require('express-validator');
+const {
+  AMOUNT_TOO_LARGE_MESSAGE,
+  isSafeCurrencyAmount,
+} = require('../utils/amountValidation');
 
 // Middleware to handle validation errors
 const handleValidationErrors = (req, res, next) => {
@@ -242,7 +246,14 @@ exports.validateIncome = [
     .notEmpty()
     .withMessage('Amount is required')
     .isFloat({ min: 0.01 })
-    .withMessage('Amount must be greater than 0'),
+    .withMessage('Amount must be greater than 0')
+    .bail()
+    .custom((value) => {
+      if (!isSafeCurrencyAmount(Number(value))) {
+        throw new Error(AMOUNT_TOO_LARGE_MESSAGE);
+      }
+      return true;
+    }),
   
   body('source')
     .notEmpty()
@@ -275,3 +286,50 @@ exports.validateIncome = [
   handleValidationErrors
 ];
 
+exports.validateIncomeUpdate = [
+  body('categoryId')
+    .optional()
+    .isMongoId()
+    .withMessage('Invalid category ID'),
+
+  body('amount')
+    .optional()
+    .isFloat({ min: 0.01 })
+    .withMessage('Amount must be greater than 0')
+    .bail()
+    .custom((value) => {
+      if (!isSafeCurrencyAmount(Number(value))) {
+        throw new Error(AMOUNT_TOO_LARGE_MESSAGE);
+      }
+      return true;
+    }),
+
+  body('source')
+    .optional()
+    .trim()
+    .isLength({ min: 1, max: 200 })
+    .withMessage('Source must be between 1 and 200 characters'),
+
+  body('description')
+    .optional()
+    .trim()
+    .isLength({ max: 500 })
+    .withMessage('Description cannot exceed 500 characters'),
+
+  body('date')
+    .optional()
+    .isISO8601()
+    .withMessage('Invalid date format'),
+
+  body('paymentMethod')
+    .optional()
+    .isIn(['cash', 'card', 'bank_transfer', 'mobile_money', 'other'])
+    .withMessage('Invalid payment method'),
+
+  body('tags')
+    .optional()
+    .isArray()
+    .withMessage('Tags must be an array'),
+
+  handleValidationErrors
+];

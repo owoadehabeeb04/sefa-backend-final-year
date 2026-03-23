@@ -11,9 +11,25 @@ const parsingService = require('../services/parsing.service');
 const ocrService = require('../services/ocr.service');
 const deduplicationService = require('../services/deduplication.service');
 const transferService = require('../services/transfer.service');
+const syncScheduler = require('../services/syncScheduler.service');
+const { normalizeImportStage, normalizeImportStatus } = require('../utils/importJobState');
 
-const { addImportJob, addSyncJob, getJobStatus } = require('../config/queue');
+const { addImportJob, getJobStatus } = require('../config/queue');
 const { downloadFromGridFS } = require('../config/gridfs');
+
+const normalizeOptionalText = (value) => {
+  const normalized = String(value || '').trim();
+  return normalized || null;
+};
+
+const normalizeAccountNumberHint = (value) => {
+  const digits = String(value || '').replace(/\D+/g, '');
+  if (!digits) {
+    return null;
+  }
+
+  return digits.slice(-4);
+};
 
 /**
  * Connect bank account via Mono
@@ -64,26 +80,39 @@ const connectBankAccount = async (req, res) => {
       balance: Number(accountDetails.account?.balance || 0),
       authCode: code, // Will be encrypted by pre-save hook
       accessToken: accountId,
-      syncStatus: 'active'
+      syncStatus: 'queued'
     });
-    
-    // Trigger initial sync
-    await addSyncJob({
-      connectionId: connection._id.toString(),
-      userId,
-      accountId,
-      isInitialSync: true
+
+    const queuedSync = await syncScheduler.queueConnectionSync(connection, userId, {
+      isInitialSync: true,
+      syncType: 'initial_connect',
+      triggeredBy: 'user',
+      forceSync: true,
+      requestMeta: {
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      },
     });
-    
+
+    connection.currentSyncLogId = queuedSync.syncLogId;
+    connection.syncStatus = queuedSync.status;
+    await connection.save();
+
     res.status(201).json({
       success: true,
-      message: 'Bank account connected successfully',
+      message: 'Bank account connected and initial sync queued',
       data: {
+        _id: connection._id,
         connectionId: connection._id,
         institutionName: connection.institutionName,
         accountName: connection.accountName,
         accountNumber: connection.accountNumber,
-        syncStatus: connection.syncStatus
+        syncStatus: connection.syncStatus,
+        currentSyncLogId: queuedSync.syncLogId,
+        initialSyncLogId: queuedSync.syncLogId,
+        lastSuccessfulSyncAt: connection.lastSuccessfulSyncAt,
+        pendingResync: connection.pendingResync,
+        lastSyncErrorSummary: connection.lastSyncErrorSummary,
       }
     });
   } catch (error) {
@@ -173,6 +202,13 @@ const getBankConnection = async (req, res) => {
         message: 'Bank connection not found'
       });
     }
+
+    if (connection.syncStatus === 'queued' || connection.syncStatus === 'syncing') {
+      return res.status(409).json({
+        success: false,
+        message: 'Cancel the active sync before disconnecting this bank account'
+      });
+    }
     
     res.json({
       success: true,
@@ -210,20 +246,23 @@ const syncBankTransactions = async (req, res) => {
       });
     }
     
-    // Add sync job to queue
-    const job = await addSyncJob({
-      connectionId: connection._id.toString(),
-      userId,
-      accountId: connection.accountId,
-      isInitialSync: false
+    const queuedSync = await syncScheduler.queueConnectionSync(connection, userId, {
+      syncType: 'manual',
+      triggeredBy: 'user',
+      forceSync: true,
+      requestMeta: {
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+      },
     });
-    
-    res.json({
+
+    res.status(202).json({
       success: true,
-      message: 'Sync job queued successfully',
+      message: queuedSync.existing ? 'Sync already queued or in progress' : 'Sync queued successfully',
       data: {
-        jobId: job.id,
-        status: 'queued'
+        connectionId: connection._id,
+        syncLogId: queuedSync.syncLogId,
+        status: queuedSync.status
       }
     });
   } catch (error) {
@@ -275,9 +314,10 @@ const disconnectBankAccount = async (req, res) => {
     const mappings = await ImportedTransactionMap.find({
       userId,
       $or: [
+        { sourceType: 'bank_connection', sourceRefId: connection._id },
+        { syncLogId: { $in: syncLogIds } },
         { 'rawData.connectionId': connection._id },
         { 'rawData.connectionId': String(connection._id) },
-        { 'rawData.accountId': connection.accountId },
         ...(syncLogIds.length ? [{ importJobId: { $in: syncLogIds } }] : []),
       ],
     });
@@ -301,6 +341,9 @@ const disconnectBankAccount = async (req, res) => {
     // Soft delete
     connection.isActive = false;
     connection.syncStatus = 'disconnected';
+    connection.currentSyncLogId = null;
+    connection.cancelRequested = false;
+    connection.pendingResync = false;
     await connection.save();
     
     res.json({
@@ -331,6 +374,10 @@ const uploadBankStatement = async (req, res) => {
     const userId = req.user.userId;
     const fileId = req.fileId;
     const fileMetadata = req.fileMetadata;
+    const bankHint = normalizeOptionalText(req.body?.bankHint || req.body?.bankName);
+    const accountNumberHint = normalizeAccountNumberHint(
+      req.body?.accountNumberHint || req.body?.accountNumber,
+    );
     
     if (!fileId) {
       return res.status(400).json({
@@ -341,27 +388,61 @@ const uploadBankStatement = async (req, res) => {
     
     // Determine file type
     const fileType = fileMetadata.mimeType === 'application/pdf' ? 'pdf' : 'csv';
-    
-    // Add import job to queue
-    const job = await addImportJob({
+
+    const importJob = await ImportJob.create({
       userId,
       source: `${fileType}_upload`,
-      fileId: fileId.toString(),
+      fileId,
       fileName: fileMetadata.originalName,
-      fileType
+      fileSize: fileMetadata.size,
+      fileType: fileType === 'pdf' ? 'application/pdf' : 'text/csv',
+      status: 'queued',
+      stage: 'queued',
+      progress: 0,
+      bankHint,
+      accountNumberHint,
+      warnings: [],
+      errorMessages: [],
     });
-    
-    res.json({
-      success: true,
-      message: 'File uploaded successfully. Processing started.',
-      data: {
-        jobId: job.id,
+
+    try {
+      const queueJob = await addImportJob({
+        importJobId: String(importJob._id),
+        userId,
+        source: importJob.source,
+        fileId: fileId.toString(),
         fileName: fileMetadata.originalName,
-        fileSize: fileMetadata.size,
         fileType,
-        status: 'queued'
-      }
-    });
+        fileSize: fileMetadata.size,
+      });
+
+      importJob.queueJobId = String(queueJob.id);
+      await importJob.save();
+
+      return res.status(202).json({
+        success: true,
+        message: 'File uploaded successfully. Processing started.',
+        data: {
+          importJobId: importJob._id,
+          queueJobId: String(queueJob.id),
+          fileName: fileMetadata.originalName,
+          fileSize: fileMetadata.size,
+          fileType: importJob.fileType,
+          status: 'queued',
+          bankHint,
+          accountNumberHint,
+        }
+      });
+    } catch (queueError) {
+      importJob.status = 'failed';
+      importJob.stage = 'failed';
+      importJob.progress = 100;
+      importJob.errorCount = 1;
+      importJob.errorMessages = [queueError.message];
+      importJob.completedAt = new Date();
+      await importJob.save();
+      throw queueError;
+    }
   } catch (error) {
     console.error('❌ Upload statement error:', error);
     res.status(500).json({
@@ -401,6 +482,18 @@ const getImportJobStatus = async (req, res) => {
       });
     }
 
+    const legacyImportJob = await ImportJob.findOne({
+      userId,
+      queueJobId: String(jobId)
+    });
+
+    if (legacyImportJob) {
+      return res.json({
+        success: true,
+        data: legacyImportJob
+      });
+    }
+
     // Otherwise treat as queue job id (Bull uses numeric/string ids like "4")
     const queueJob = await getJobStatus('import', jobId);
 
@@ -421,7 +514,7 @@ const getImportJobStatus = async (req, res) => {
     }
 
     let importJob = null;
-    const importJobId = queueJob.returnvalue?.importJobId;
+    const importJobId = queueJob.data?.importJobId || queueJob.returnvalue?.importJobId;
 
     if (importJobId && mongoose.isValidObjectId(importJobId)) {
       importJob = await ImportJob.findOne({ _id: importJobId, userId });
@@ -449,22 +542,32 @@ const getImportJobStatus = async (req, res) => {
     }
 
     const statusFromQueue = {
-      waiting: 'pending',
+      waiting: 'queued',
       active: 'processing',
       completed: 'completed',
       failed: 'failed',
-      delayed: 'pending'
+      delayed: 'queued'
     };
 
     return res.json({
       success: true,
       data: {
-        status: statusFromQueue[queueJob.state] || 'pending',
-        stage: queueJob.state,
+        status: normalizeImportStatus(statusFromQueue[queueJob.state] || 'queued'),
+        stage: normalizeImportStage(queueJob.state, statusFromQueue[queueJob.state] || 'queued'),
         progress: Number(queueJob.progress || 0),
+        queueJobId: String(queueJob.id),
         fileName: queueJob.data?.fileName || null,
+        detectedBank: 'unknown',
+        detectedBankDisplayName: 'Unknown bank',
+        bankDetectionConfidence: 'unknown',
+        bankDetectionSource: 'queue_fallback',
         errorCount: queueJob.failedReason ? 1 : 0,
-        errors: queueJob.failedReason ? [queueJob.failedReason] : []
+        skippedCount: 0,
+        errors: queueJob.failedReason ? [queueJob.failedReason] : [],
+        errorMessages: queueJob.failedReason ? [queueJob.failedReason] : [],
+        qualityFlags: [],
+        needsReview: false,
+        warnings: []
       },
       queue: {
         id: queueJob.id,
@@ -547,7 +650,7 @@ const undoImport = async (req, res) => {
     if (!job.canBeUndone()) {
       return res.status(400).json({
         success: false,
-        message: job.status === 'undone' 
+        message: normalizeImportStatus(job.status) === 'undone' 
           ? 'Import already undone' 
           : 'Import cannot be undone'
       });
@@ -570,8 +673,7 @@ const undoImport = async (req, res) => {
     ]);
     
     // Mark job as undone
-    job.status = 'undone';
-    await job.save();
+    await job.markAsUndone();
     
     res.json({
       success: true,
@@ -611,21 +713,19 @@ const handleMonoWebhook = async (req, res) => {
     
     if (!connection) {
       console.warn(`⚠️  Connection not found for account ${accountId}`);
-      return res.status(404).json({
-        success: false,
-        message: 'Connection not found'
+      return res.status(200).json({
+        success: true,
+        message: 'Webhook ignored for unknown connection'
       });
     }
     
     // Handle different events
     switch (req.webhookEvent) {
       case 'transaction_synced':
-        // Trigger sync job
-        await addSyncJob({
-          connectionId: connection._id.toString(),
-          userId: connection.userId.toString(),
-          accountId,
-          isInitialSync: false
+        await syncScheduler.queueConnectionSync(connection, connection.userId.toString(), {
+          syncType: 'webhook',
+          triggeredBy: 'webhook',
+          forceSync: true,
         });
         break;
         

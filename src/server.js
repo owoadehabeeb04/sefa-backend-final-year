@@ -1,4 +1,5 @@
 const path = require('path');
+const os = require('os');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const express = require('express');
 const cors = require('cors');
@@ -11,11 +12,9 @@ const { startCleanupJob } = require('./utils/cleanupJob');
 const { initializeProcessors, closeQueues } = require('./config/queue');
 const schedulerService = require('./services/scheduler.service');
 const { startSyncCronJobs, stopSyncCronJobs } = require('./jobs/syncCronJobs');
+const { assertBrevoConfigured } = require('./services/otpService');
 
 const app = express();
-
-// Start cleanup job for unverified users
-startCleanupJob();
 
 // Swagger documentation
 swaggerSetup(app);
@@ -26,7 +25,13 @@ app.use(cors({
   origin: process.env.CORS_ORIGIN?.split(',') || '*',
   credentials: true
 }));
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buffer) => {
+    if (req.originalUrl?.includes('/api/v1/bank/webhook')) {
+      req.rawBody = Buffer.from(buffer);
+    }
+  },
+}));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));
 
@@ -61,13 +66,38 @@ app.use((err, req, res, next) => {
   });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const HOST = process.env.HOST || '0.0.0.0';
 let server;
+
+const getNetworkUrls = () => {
+  if (HOST !== '0.0.0.0') {
+    return [`http://${HOST}:${PORT}`];
+  }
+
+  const interfaces = os.networkInterfaces();
+  const urls = [];
+
+  for (const networkInterface of Object.values(interfaces)) {
+    for (const address of networkInterface || []) {
+      if (address.family === 'IPv4' && !address.internal) {
+        urls.push(`http://${address.address}:${PORT}`);
+      }
+    }
+  }
+
+  return urls;
+};
 
 const bootstrap = async () => {
   try {
+    assertBrevoConfigured();
+
     // Connect to MongoDB first
     await connectDB();
+
+    // Start cleanup job only after MongoDB is ready
+    startCleanupJob();
 
     // Initialize GridFS after MongoDB is connected
     initGridFS();
@@ -81,8 +111,11 @@ const bootstrap = async () => {
     // Start sync cron jobs
     startSyncCronJobs();
 
-    server = app.listen(PORT, () => {
-      console.log(`Server is running on port ${PORT}`);
+    server = app.listen(PORT, HOST, () => {
+      console.log(`Server is running on ${HOST}:${PORT}`);
+      for (const url of getNetworkUrls()) {
+        console.log(`API reachable at ${url}/api/v1`);
+      }
       console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
     });
   } catch (error) {

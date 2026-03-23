@@ -3,14 +3,27 @@ const Income = require('../models/Income');
 const Budget = require('../models/Budget');
 const Category = require('../models/Category');
 const Groq = require('groq-sdk');
+const mongoose = require('mongoose');
 const moment = require('moment');
 
 // Initialize Groq client
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY
-});
+const groq = process.env.GROQ_API_KEY
+  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
+  : null;
 
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+
+const shouldUseGroq = () =>
+  Boolean(groq)
+  && process.env.GROQ_API_KEY !== 'test-groq-key'
+  && process.env.NODE_ENV !== 'test';
+
+function normalizeUserId(userId) {
+  if (mongoose.Types.ObjectId.isValid(userId)) {
+    return new mongoose.Types.ObjectId(String(userId));
+  }
+  return userId;
+}
 
 /**
  * Budget Recommendation Engine
@@ -53,13 +66,14 @@ async function generateBudgetRecommendations(userId, options = {}) {
  * @returns {Promise<Object>} Spending analysis
  */
 async function analyzeSpendingHistory(userId, months) {
+  const normalizedUserId = normalizeUserId(userId);
   const startDate = moment().subtract(months, 'months').startOf('month').toDate();
   const endDate = moment().endOf('day').toDate();
 
   const monthlySpending = await Expense.aggregate([
     {
       $match: {
-        userId: userId,
+        userId: normalizedUserId,
         date: { $gte: startDate, $lte: endDate }
       }
     },
@@ -107,13 +121,14 @@ async function analyzeSpendingHistory(userId, months) {
  * @returns {Promise<Object>} Income analysis
  */
 async function analyzeIncomeHistory(userId, months) {
+  const normalizedUserId = normalizeUserId(userId);
   const startDate = moment().subtract(months, 'months').startOf('month').toDate();
   const endDate = moment().endOf('day').toDate();
 
   const monthlyIncome = await Income.aggregate([
     {
       $match: {
-        userId: userId,
+        userId: normalizedUserId,
         date: { $gte: startDate, $lte: endDate }
       }
     },
@@ -151,9 +166,8 @@ async function analyzeIncomeHistory(userId, months) {
  * @returns {Promise<Array>} Current budgets
  */
 async function getCurrentBudgets(userId) {
-  return await Budget.find({ userId, isActive: true })
-    .populate('categoryId')
-    .select('categoryId limit period spent');
+  return Budget.find({ userId, isActive: true })
+    .select('category amount period startDate endDate');
 }
 
 /**
@@ -163,13 +177,14 @@ async function getCurrentBudgets(userId) {
  * @returns {Promise<Array>} Category averages
  */
 async function getCategorySpendingAverages(userId, months) {
+  const normalizedUserId = normalizeUserId(userId);
   const startDate = moment().subtract(months, 'months').startOf('month').toDate();
   const endDate = moment().endOf('day').toDate();
 
   const categoryData = await Expense.aggregate([
     {
       $match: {
-        userId: userId,
+        userId: normalizedUserId,
         date: { $gte: startDate, $lte: endDate }
       }
     },
@@ -297,14 +312,16 @@ function generateBudgetAdjustments(currentBudgets, categorySpending) {
   const adjustments = [];
 
   currentBudgets.forEach(budget => {
-    const categoryId = budget.categoryId?._id?.toString();
-    const spending = categorySpending.find(cat => cat.categoryId?.toString() === categoryId);
+    const normalizedCategory = String(budget.category || '').trim().toLowerCase();
+    const spending = categorySpending.find(cat =>
+      String(cat.categoryName || '').trim().toLowerCase() === normalizedCategory
+    );
 
     if (spending) {
-      const utilizationRate = budget.limit > 0 ? (spending.monthlyAverage / budget.limit) * 100 : 0;
+      const utilizationRate = budget.amount > 0 ? (spending.monthlyAverage / budget.amount) * 100 : 0;
 
       let recommendation = 'maintain';
-      let newLimit = budget.limit;
+      let newLimit = budget.amount;
       let reason = 'Current budget is appropriate';
 
       if (utilizationRate > 90) {
@@ -318,9 +335,8 @@ function generateBudgetAdjustments(currentBudgets, categorySpending) {
       }
 
       adjustments.push({
-        categoryId: budget.categoryId._id,
-        categoryName: budget.categoryId.name,
-        currentLimit: budget.limit,
+        categoryName: budget.category,
+        currentLimit: budget.amount,
         currentSpending: spending.monthlyAverage,
         utilizationRate: Math.round(utilizationRate),
         recommendation,
@@ -370,13 +386,17 @@ function calculateRecommendedSavings(income, spending) {
  */
 async function generateAIBudgetAdvice(spending, income, categorySpending) {
   try {
-    const topCategories = categorySpending.slice(0, 5).map(cat =>
-      `${cat.categoryName}: ₦${cat.monthlyAverage.toLocaleString()}`
-    ).join(', ');
-
     const savingsRate = income.monthlyAverage > 0
       ? ((income.monthlyAverage - spending.monthlyAverage) / income.monthlyAverage) * 100
       : 0;
+
+    if (!shouldUseGroq()) {
+      return getFallbackBudgetAdvice(savingsRate);
+    }
+
+    const topCategories = categorySpending.slice(0, 5).map(cat =>
+      `${cat.categoryName}: ₦${cat.monthlyAverage.toLocaleString()}`
+    ).join(', ');
 
     const prompt = `You are a Nigerian financial advisor. Provide practical budget advice based on this financial data:
 
@@ -486,13 +506,13 @@ function calculateTrend(values) {
  */
 function getBudgetHealthMessage(status, savingsRate) {
   const messages = {
-    'excellent': `Excellent financial health! You're saving ${Math.round(savingsRate)}% of your income.`,
-    'good': `Good financial discipline. Keep up the savings momentum.`,
-    'fair': `Room for improvement. Try to increase your savings rate to at least 10%.`,
-    'needs improvement': `Consider reviewing your expenses to improve your savings rate.`
+    'excellent': `You are doing well. You save about ${Math.round(savingsRate)}% of your income.`,
+    'good': 'You are trying. Keep your spending under control.',
+    'fair': 'You can still do better. Try to save at least 10% of your income.',
+    'needs improvement': 'Check your spending well so you can save more.'
   };
 
-  return messages[status] || 'Keep tracking your expenses to improve financial health.';
+  return messages[status] || 'Keep tracking your spending so things can improve.';
 }
 
 /**
@@ -505,11 +525,11 @@ function getBudgetHealthMessage(status, savingsRate) {
  */
 function getCategoryRecommendationMessage(categoryName, status, current, recommended) {
   if (status === 'over') {
-    return `You're spending ${Math.round(current - recommended)}% more than recommended on ${categoryName}. Consider reducing expenses in this category.`;
+    return `You are spending ${Math.round(current - recommended)}% more than expected on ${categoryName}. Try to reduce it.`;
   } else if (status === 'under') {
-    return `Your ${categoryName} spending is below typical levels. This is good if intentional.`;
+    return `Your ${categoryName} spending is lower than normal. That is okay if you planned it.`;
   }
-  return `Your ${categoryName} budget is well-balanced.`;
+  return `Your ${categoryName} spending looks okay.`;
 }
 
 /**
@@ -519,13 +539,13 @@ function getCategoryRecommendationMessage(categoryName, status, current, recomme
  */
 function getFallbackBudgetAdvice(savingsRate) {
   if (savingsRate >= 20) {
-    return "Great job on your savings! Consider investing excess funds for long-term growth. Keep tracking your expenses to maintain this healthy financial position.";
+    return "You are saving well. Keep tracking your spending and think about safe ways to grow extra money.";
   } else if (savingsRate >= 10) {
-    return "You're saving a decent amount. Try to increase your savings rate to 20% by reviewing your discretionary spending. Focus on your top 3 expense categories.";
+    return "You are saving small. Try to push it to 20% by checking your top spending areas.";
   } else if (savingsRate >= 0) {
-    return "Your savings rate could be improved. Review your spending categories and identify areas to cut back. Start with small changes like reducing entertainment or food expenses.";
+    return "Your saving is low. Check where your money is going and cut one or two areas first.";
   } else {
-    return "You're spending more than you earn. This is unsustainable. Immediately review all expenses and cut non-essential items. Consider finding additional income sources.";
+    return "You are spending more than you earn. Cut non-important spending fast and look for extra income.";
   }
 }
 

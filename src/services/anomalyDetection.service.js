@@ -1,5 +1,6 @@
 const Expense = require('../models/Expense');
 const Income = require('../models/Income');
+const mongoose = require('mongoose');
 const moment = require('moment');
 
 /**
@@ -68,6 +69,13 @@ async function detectAnomalies(userId, options = {}) {
     anomalies: allAnomalies,
     recommendations: generateAnomalyRecommendations(allAnomalies)
   };
+}
+
+function normalizeUserId(userId) {
+  if (mongoose.Types.ObjectId.isValid(userId)) {
+    return new mongoose.Types.ObjectId(String(userId));
+  }
+  return userId;
 }
 
 /**
@@ -197,6 +205,7 @@ async function detectFrequencyAnomalies(userId, startDate, endDate, threshold) {
  * @returns {Promise<Array>} Category anomalies
  */
 async function detectCategoryAnomalies(userId, startDate, endDate, threshold) {
+  const normalizedUserId = normalizeUserId(userId);
   // Compare recent category spending with historical averages
   const recentStart = moment().subtract(7, 'days').startOf('day').toDate();
   const historicalStart = moment().subtract(90, 'days').startOf('day').toDate();
@@ -206,7 +215,7 @@ async function detectCategoryAnomalies(userId, startDate, endDate, threshold) {
     Expense.aggregate([
       {
         $match: {
-          userId: userId,
+          userId: normalizedUserId,
           date: { $gte: recentStart, $lte: endDate }
         }
       },
@@ -221,7 +230,7 @@ async function detectCategoryAnomalies(userId, startDate, endDate, threshold) {
     Expense.aggregate([
       {
         $match: {
-          userId: userId,
+          userId: normalizedUserId,
           date: { $gte: historicalStart, $lte: historicalEnd }
         }
       },
@@ -370,10 +379,11 @@ async function detectPotentialDuplicates(userId, startDate, endDate) {
  * @returns {Promise<Array>} Income anomalies
  */
 async function detectIncomeAnomalies(userId, startDate, endDate) {
+  const normalizedUserId = normalizeUserId(userId);
   const monthlyIncome = await Income.aggregate([
     {
       $match: {
-        userId: userId,
+        userId: normalizedUserId,
         date: { $gte: startDate, $lte: endDate }
       }
     },

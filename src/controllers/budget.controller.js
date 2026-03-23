@@ -413,8 +413,12 @@ exports.getSpendingForecast = asyncHandler(async (req, res) => {
 
   // Current period progress
   const progress = await budget.getProgress();
-  const daysInPeriod = Math.ceil((budget.endDate - budget.startDate) / (1000 * 60 * 60 * 24));
-  const daysElapsed = Math.ceil((new Date() - budget.startDate) / (1000 * 60 * 60 * 24));
+  const MS_PER_DAY = 1000 * 60 * 60 * 24;
+  const daysInPeriod = Math.max(1, Math.floor((budget.endDate - budget.startDate) / MS_PER_DAY) + 1);
+  const daysElapsed = Math.max(1, Math.min(
+    daysInPeriod,
+    Math.floor((new Date() - budget.startDate) / MS_PER_DAY) + 1,
+  ));
   const daysRemaining = Math.max(daysInPeriod - daysElapsed, 0);
 
   // Forecast based on current spending rate

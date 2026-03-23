@@ -1,5 +1,14 @@
 const mongoose = require('mongoose');
 
+const normalizeSerializedSyncLog = (_doc, ret) => {
+  if (ret.results) {
+    ret.results.errorCount = ret.results.errorCount ?? ret.results.errors ?? 0;
+    ret.results.errors = ret.results.errorCount;
+  }
+
+  return ret;
+};
+
 /**
  * SyncLog Model
  * 
@@ -31,22 +40,35 @@ const syncLogSchema = new mongoose.Schema({
   // Sync type
   syncType: {
     type: String,
-    enum: ['manual', 'automatic', 'initial', 'retry', 'scheduled'],
+    enum: ['manual', 'automatic', 'initial', 'initial_connect', 'retry', 'scheduled', 'webhook'],
     default: 'automatic'
   },
 
   // Sync status
   status: {
     type: String,
-    enum: ['pending', 'processing', 'completed', 'failed', 'partial'],
-    default: 'pending',
+    enum: ['pending', 'processing', 'partial', 'queued', 'syncing', 'completed', 'partial_success', 'failed', 'cancelled'],
+    default: 'queued',
     index: true
+  },
+  phase: {
+    type: String,
+    enum: ['queued', 'fetching', 'normalizing', 'deduplicating', 'categorizing', 'persisting', 'finalizing', 'completed', 'failed', 'cancelled'],
+    default: 'queued'
+  },
+  queueJobId: {
+    type: String,
+    default: null,
+    index: true
+  },
+  cancelRequested: {
+    type: Boolean,
+    default: false
   },
 
   // Timestamps
   startedAt: {
     type: Date,
-    default: Date.now,
     index: true
   },
 
@@ -73,7 +95,15 @@ const syncLogSchema = new mongoose.Schema({
       type: Number,
       default: 0
     },
+    importedCount: {
+      type: Number,
+      default: 0
+    },
     newTransactions: {
+      type: Number,
+      default: 0
+    },
+    duplicateCount: {
       type: Number,
       default: 0
     },
@@ -81,15 +111,32 @@ const syncLogSchema = new mongoose.Schema({
       type: Number,
       default: 0
     },
+    transferCount: {
+      type: Number,
+      default: 0
+    },
     transfers: {
       type: Number,
       default: 0
     },
-    errors: {
+    skippedCount: {
+      type: Number,
+      default: 0
+    },
+    failedCount: {
+      type: Number,
+      default: 0
+    },
+    errorCount: {
       type: Number,
       default: 0
     }
   },
+  errorList: [{
+    externalId: String,
+    stage: String,
+    message: String
+  }],
 
   // Error information
   error: {
@@ -145,7 +192,8 @@ syncLogSchema.index({ createdAt: 1 }, { expireAfterSeconds: 7776000 }); // TTL: 
 // Virtual for success rate
 syncLogSchema.virtual('successRate').get(function() {
   if (this.results.totalFetched === 0) return 0;
-  return ((this.results.newTransactions / this.results.totalFetched) * 100).toFixed(2);
+  const importedCount = this.results.importedCount ?? this.results.newTransactions ?? 0;
+  return ((importedCount / this.results.totalFetched) * 100).toFixed(2);
 });
 
 // Instance Methods
@@ -154,7 +202,8 @@ syncLogSchema.virtual('successRate').get(function() {
  * Mark sync as started
  */
 syncLogSchema.methods.markAsStarted = function() {
-  this.status = 'processing';
+  this.status = 'syncing';
+  this.phase = 'fetching';
   this.startedAt = new Date();
   return this.save();
 };
@@ -164,12 +213,22 @@ syncLogSchema.methods.markAsStarted = function() {
  * @param {Object} results - Sync results
  */
 syncLogSchema.methods.markAsCompleted = function(results = {}) {
+  const { errors, ...restResults } = results;
+
   this.status = 'completed';
+  this.phase = 'completed';
   this.completedAt = new Date();
-  this.duration = this.completedAt - this.startedAt;
+  this.duration = this.startedAt ? this.completedAt - this.startedAt : undefined;
   this.results = {
     ...this.results,
-    ...results
+    importedCount: restResults.importedCount ?? restResults.newTransactions ?? this.results.importedCount,
+    newTransactions: restResults.newTransactions ?? restResults.importedCount ?? this.results.newTransactions,
+    duplicateCount: restResults.duplicateCount ?? restResults.duplicates ?? this.results.duplicateCount,
+    duplicates: restResults.duplicates ?? restResults.duplicateCount ?? this.results.duplicates,
+    transferCount: restResults.transferCount ?? restResults.transfers ?? this.results.transferCount,
+    transfers: restResults.transfers ?? restResults.transferCount ?? this.results.transfers,
+    errorCount: restResults.errorCount ?? errors ?? this.results.errorCount,
+    ...restResults
   };
   return this.save();
 };
@@ -180,8 +239,9 @@ syncLogSchema.methods.markAsCompleted = function(results = {}) {
  */
 syncLogSchema.methods.markAsFailed = function(error) {
   this.status = 'failed';
+  this.phase = 'failed';
   this.completedAt = new Date();
-  this.duration = this.completedAt - this.startedAt;
+  this.duration = this.startedAt ? this.completedAt - this.startedAt : undefined;
   this.error = {
     message: error.message,
     code: error.code || 'SYNC_ERROR',
@@ -238,12 +298,35 @@ syncLogSchema.methods.isRetryableError = function(error) {
  * @param {Object} results - Partial results
  */
 syncLogSchema.methods.markAsPartial = function(results = {}) {
-  this.status = 'partial';
+  const { errors, ...restResults } = results;
+
+  this.status = 'partial_success';
+  this.phase = 'completed';
   this.completedAt = new Date();
-  this.duration = this.completedAt - this.startedAt;
+  this.duration = this.startedAt ? this.completedAt - this.startedAt : undefined;
   this.results = {
     ...this.results,
-    ...results
+    importedCount: restResults.importedCount ?? restResults.newTransactions ?? this.results.importedCount,
+    newTransactions: restResults.newTransactions ?? restResults.importedCount ?? this.results.newTransactions,
+    duplicateCount: restResults.duplicateCount ?? restResults.duplicates ?? this.results.duplicateCount,
+    duplicates: restResults.duplicates ?? restResults.duplicateCount ?? this.results.duplicates,
+    transferCount: restResults.transferCount ?? restResults.transfers ?? this.results.transferCount,
+    transfers: restResults.transfers ?? restResults.transferCount ?? this.results.transfers,
+    errorCount: restResults.errorCount ?? errors ?? this.results.errorCount,
+    ...restResults
+  };
+  return this.save();
+};
+
+syncLogSchema.methods.markAsCancelled = function(message = 'Sync cancelled') {
+  this.status = 'cancelled';
+  this.phase = 'cancelled';
+  this.completedAt = new Date();
+  this.duration = this.startedAt ? this.completedAt - this.startedAt : undefined;
+  this.error = {
+    message,
+    code: 'SYNC_CANCELLED',
+    retryable: false
   };
   return this.save();
 };
@@ -307,13 +390,13 @@ syncLogSchema.statics.getConnectionStats = async function(connectionId, days = 3
   });
 
   const total = logs.length;
-  const successful = logs.filter(log => log.status === 'completed').length;
+  const successful = logs.filter(log => ['completed', 'partial_success'].includes(log.status)).length;
   const failed = logs.filter(log => log.status === 'failed').length;
-  const partial = logs.filter(log => log.status === 'partial').length;
+  const partial = logs.filter(log => ['partial', 'partial_success'].includes(log.status)).length;
 
-  const totalTransactions = logs.reduce((sum, log) => sum + (log.results.newTransactions || 0), 0);
-  const totalDuplicates = logs.reduce((sum, log) => sum + (log.results.duplicates || 0), 0);
-  const totalTransfers = logs.reduce((sum, log) => sum + (log.results.transfers || 0), 0);
+  const totalTransactions = logs.reduce((sum, log) => sum + (log.results.importedCount || log.results.newTransactions || 0), 0);
+  const totalDuplicates = logs.reduce((sum, log) => sum + (log.results.duplicateCount || log.results.duplicates || 0), 0);
+  const totalTransfers = logs.reduce((sum, log) => sum + (log.results.transferCount || log.results.transfers || 0), 0);
 
   const avgDuration = logs.filter(log => log.duration).reduce((sum, log) => sum + log.duration, 0) / (logs.filter(log => log.duration).length || 1);
 
@@ -390,6 +473,9 @@ syncLogSchema.statics.cleanOldLogs = async function(days = 90) {
     cutoffDate
   };
 };
+
+syncLogSchema.set('toJSON', { virtuals: true, transform: normalizeSerializedSyncLog });
+syncLogSchema.set('toObject', { virtuals: true, transform: normalizeSerializedSyncLog });
 
 const SyncLog = mongoose.model('SyncLog', syncLogSchema);
 

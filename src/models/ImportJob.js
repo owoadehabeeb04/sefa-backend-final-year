@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { normalizeImportStage, normalizeImportStatus } = require('../utils/importJobState');
 
 const importJobSchema = new mongoose.Schema({
   userId: {
@@ -43,34 +44,43 @@ const importJobSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     default: null // GridFS file ID
   },
+  queueJobId: {
+    type: String,
+    default: null,
+    index: true
+  },
 
   // Processing status
   status: {
     type: String,
     required: true,
-    enum: ['pending', 'processing', 'completed', 'failed', 'undone'],
-    default: 'pending',
+    enum: ['pending', 'queued', 'processing', 'completed', 'failed', 'undone'],
+    default: 'queued',
     index: true
   },
   stage: {
     type: String,
     enum: [
+      'queued',
       'download',
       'parse',
+      'ocr',
+      'normalize',
+      'deduplicate',
+      'categorize',
+      'save',
       'deduplicate_internal',
       'deduplicate_database',
       'detect_transfers',
-      'save',
       'parsing',
       'deduplicating',
       'categorizing',
       'saving',
       'completed',
-      'fetch',
-      'normalize',
-      'deduplicate'
+      'failed',
+      'fetch'
     ],
-    default: 'parsing'
+    default: 'queued'
   },
   progress: {
     type: Number,
@@ -80,6 +90,16 @@ const importJobSchema = new mongoose.Schema({
   },
 
   // Results
+  sourceRecordCount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  validRecordCount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
   totalTransactions: {
     type: Number,
     default: 0,
@@ -100,11 +120,67 @@ const importJobSchema = new mongoose.Schema({
     default: 0,
     min: 0
   },
-  errors: [{
+  skippedCount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  errorMessages: [{
     type: String
   }],
+  warnings: [{
+    type: String
+  }],
+  detectedBank: {
+    type: String,
+    default: 'unknown',
+    trim: true
+  },
+  detectedBankDisplayName: {
+    type: String,
+    default: 'Unknown bank',
+    trim: true
+  },
+  bankDetectionConfidence: {
+    type: String,
+    enum: ['high', 'medium', 'low', 'unknown'],
+    default: 'unknown'
+  },
+  bankDetectionSource: {
+    type: String,
+    default: 'unknown',
+    trim: true
+  },
+  bankHint: {
+    type: String,
+    default: null,
+    trim: true
+  },
+  accountNumberHint: {
+    type: String,
+    default: null,
+    trim: true
+  },
+  parser: {
+    type: String,
+    default: null,
+    trim: true
+  },
+  ocrProvider: {
+    type: String,
+    enum: ['azure', 'google', null],
+    default: null
+  },
 
   // Import metadata
+  statementDateRange: {
+    from: {
+      type: Date
+    },
+    to: {
+      type: Date
+    }
+  },
   dateRange: {
     from: {
       type: Date
@@ -112,6 +188,13 @@ const importJobSchema = new mongoose.Schema({
     to: {
       type: Date
     }
+  },
+  qualityFlags: [{
+    type: String
+  }],
+  needsReview: {
+    type: Boolean,
+    default: false
   },
 
   // Undo tracking
@@ -151,6 +234,10 @@ importJobSchema.pre('save', function(next) {
     const retentionDays = parseInt(process.env.IMPORT_RETENTION_DAYS) || 90;
     this.retentionExpiresAt = new Date(Date.now() + retentionDays * 24 * 60 * 60 * 1000);
   }
+
+  this.status = normalizeImportStatus(this.status);
+  this.stage = normalizeImportStage(this.stage, this.status);
+
   next();
 });
 
@@ -163,19 +250,19 @@ importJobSchema.virtual('successRate').get(function() {
 // Virtual for status display
 importJobSchema.virtual('statusDisplay').get(function() {
   const statusMap = {
-    pending: 'Pending',
+    queued: 'Queued',
     processing: 'Processing',
     completed: 'Completed',
     failed: 'Failed',
     undone: 'Undone'
   };
-  return statusMap[this.status] || this.status;
+  return statusMap[normalizeImportStatus(this.status)] || this.status;
 });
 
 // Instance method to check if can be undone
 importJobSchema.methods.canBeUndone = function() {
   return (
-    this.status === 'completed' &&
+    normalizeImportStatus(this.status) === 'completed' &&
     !this.isUndone &&
     this.importedCount > 0 &&
     new Date() < this.retentionExpiresAt
@@ -187,16 +274,27 @@ importJobSchema.methods.markAsUndone = async function() {
   this.isUndone = true;
   this.undoneAt = new Date();
   this.status = 'undone';
+  this.stage = 'completed';
   return this.save();
 };
 
 // Instance method to update progress
 importJobSchema.methods.updateProgress = async function(stage, progress) {
-  this.stage = stage;
+  this.stage = normalizeImportStage(stage, this.status);
   this.progress = Math.min(100, Math.max(0, progress));
-  if (progress >= 100 && stage === 'completed') {
+  if (this.stage !== 'queued' && !this.startedAt) {
+    this.startedAt = new Date();
+  }
+  if (progress >= 100 && this.stage === 'completed') {
     this.status = 'completed';
     this.completedAt = new Date();
+  } else if (this.stage === 'failed') {
+    this.status = 'failed';
+    this.completedAt = new Date();
+  } else if (this.stage === 'queued') {
+    this.status = 'queued';
+  } else {
+    this.status = 'processing';
   }
   return this.save();
 };
@@ -250,9 +348,24 @@ importJobSchema.statics.getUserStats = async function(userId) {
   };
 };
 
+const normalizeSerializedImportJob = (_doc, ret) => {
+  ret.status = normalizeImportStatus(ret.status);
+  ret.stage = normalizeImportStage(ret.stage, ret.status);
+  ret.errorMessages = ret.errorMessages || ret.errors || [];
+  ret.errors = ret.errorMessages;
+  ret.statementDateRange = ret.statementDateRange || ret.dateRange || null;
+  ret.dateRange = ret.statementDateRange || ret.dateRange || null;
+  ret.detectedBankDisplayName = ret.detectedBankDisplayName || 'Unknown bank';
+  ret.bankDetectionConfidence = ret.bankDetectionConfidence || 'unknown';
+  ret.bankDetectionSource = ret.bankDetectionSource || 'unknown';
+  ret.qualityFlags = ret.qualityFlags || [];
+  ret.needsReview = Boolean(ret.needsReview);
+  return ret;
+};
+
 // Ensure virtuals are included in JSON
-importJobSchema.set('toJSON', { virtuals: true });
-importJobSchema.set('toObject', { virtuals: true });
+importJobSchema.set('toJSON', { virtuals: true, transform: normalizeSerializedImportJob });
+importJobSchema.set('toObject', { virtuals: true, transform: normalizeSerializedImportJob });
 
 const ImportJob = mongoose.model('ImportJob', importJobSchema);
 

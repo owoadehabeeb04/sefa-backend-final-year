@@ -1,9 +1,9 @@
 const Groq = require('groq-sdk');
 
 // Initialize Groq client
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY
-});
+const groq = process.env.GROQ_API_KEY
+  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
+  : null;
 
 /**
  * Generate a financial insight using Groq AI
@@ -19,6 +19,10 @@ const groq = new Groq({
  */
 async function generateFinancialInsight(userData) {
   try {
+    if (!groq || process.env.NODE_ENV === 'test') {
+      return getFallbackInsight(userData);
+    }
+
     const {
       totalIncome = 0,
       totalExpenses = 0,
@@ -130,6 +134,10 @@ Provide ONLY the insight, nothing else:`;
  */
 async function generateDetailedFinancialInsight(userData) {
   try {
+    if (!groq || process.env.NODE_ENV === 'test') {
+      return getDetailedFallbackInsight(userData);
+    }
+
     const {
       totalIncome = 0,
       totalExpenses = 0,

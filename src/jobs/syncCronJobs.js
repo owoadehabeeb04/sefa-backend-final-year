@@ -74,12 +74,11 @@ const retryFailedSyncsJob = cron.schedule('*/30 * * * *', async () => {
         log.syncType = 'retry';
         await log.save();
 
-        // Attempt sync
-        await syncScheduler.syncBankConnection(
-          log.connectionId._id,
-          log.userId,
-          { forceSync: true }
-        );
+        await syncScheduler.queueConnectionSync(log.connectionId, log.userId, {
+          syncType: 'retry',
+          triggeredBy: 'system',
+          forceSync: true,
+        });
 
         successful++;
         console.log(`[Retry Cron] Successfully retried sync for connection ${log.connectionId._id}`);

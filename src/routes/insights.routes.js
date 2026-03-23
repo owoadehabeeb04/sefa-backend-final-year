@@ -30,6 +30,9 @@ router.use(protect);
  *         description: Unauthorized
  */
 router.get('/comprehensive', insightsController.getComprehensiveInsights);
+router.get('/hub', insightsController.getInsightsHub);
+router.get('/health-score', insightsController.getHealthScore);
+router.get('/forecast', insightsController.getForecast);
 
 /**
  * @swagger
@@ -229,6 +232,9 @@ router.get('/monthly-comparison', insightsController.getMonthlyComparison);
  *         description: Transaction categorized
  */
 router.post('/categorize-transaction', insightsController.categorizeTransaction);
+router.post('/what-if', insightsController.runWhatIfScenario);
+router.post('/chat', insightsController.chatWithCopilot);
+router.post('/feedback', insightsController.submitFeedback);
 
 /**
  * @swagger

@@ -1,648 +1,999 @@
 const BankConnection = require('../models/BankConnection');
+const SyncLog = require('../models/SyncLog');
+const ImportedTransactionMap = require('../models/ImportedTransactionMap');
+const Expense = require('../models/Expense');
+const Income = require('../models/Income');
+const Category = require('../models/Category');
+
 const monoService = require('./mono.service');
+const { buildScopedExternalId: buildIngestScopedExternalId, ingestTransactions } = require('./transactionIngest.service');
 const deduplicationService = require('./deduplication.service');
 const transferDetectionService = require('./transfer.service');
 const aiCategorizationService = require('./aiCategorization.service');
-const Expense = require('../models/Expense');
-const Income = require('../models/Income');
-const ImportedTransactionMap = require('../models/ImportedTransactionMap');
-const Category = require('../models/Category');
-const { addNotificationJob } = require('../config/queue');
 const AppError = require('../utils/AppError');
 
-/**
- * Sync Scheduler Service
- * 
- * Handles background synchronization of bank connections:
- * - Fetches new transactions from Mono API
- * - Deduplicates transactions
- * - Detects and links transfers
- * - Schedules notifications for new imports
- * - Updates sync timestamps and status
- */
+const ACTIVE_SYNC_STATUSES = ['queued', 'syncing', 'pending', 'processing'];
+const MAX_SYNC_ERRORS = 20;
+const AI_TIMEOUT_MS = 1500;
 
-/**
- * Sync all active connections due for sync
- * Called by cron job or manual trigger
- * 
- * @param {Object} options - Sync options
- * @param {boolean} options.forceSync - Force sync even if not due
- * @returns {Promise<Object>} Sync results summary
- */
-const syncAllConnections = async (options = {}) => {
-  const { forceSync = false } = options;
+const calculateNextSync = (intervalHours = 12) => {
+  const parsed = Number(intervalHours);
+  const safeHours = Number.isFinite(parsed) && parsed > 0 ? parsed : 12;
+  return new Date(Date.now() + safeHours * 60 * 60 * 1000);
+};
+
+const buildScopedExternalId = (connectionId, externalId) =>
+  buildIngestScopedExternalId(`mono:${String(connectionId)}`, String(externalId));
+
+const withTimeout = async (promise, timeoutMs) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('AI categorization timed out')), timeoutMs);
+    }),
+  ]);
+
+const normalizeMonoTransaction = (rawTransaction, { connectionId, userId }) => {
+  if (!rawTransaction) return null;
+
+  const externalId = String(
+    rawTransaction._id ||
+      rawTransaction.id ||
+      rawTransaction.transactionId ||
+      rawTransaction.reference ||
+      '',
+  ).trim();
+
+  const postedAt = new Date(rawTransaction.date || rawTransaction.createdAt || rawTransaction.postedAt || Date.now());
+  if (!externalId || Number.isNaN(postedAt.getTime())) {
+    return null;
+  }
+
+  const direction = rawTransaction.type === 'credit' ? 'credit' : 'debit';
+  const amount = Math.abs(Number(rawTransaction.amount || 0));
+
+  if (!amount || amount <= 0) {
+    return null;
+  }
+
+  return {
+    externalId,
+    scopedExternalId: buildScopedExternalId(connectionId, externalId),
+    connectionId: String(connectionId),
+    userId: String(userId),
+    amount,
+    postedAt,
+    description: String(rawTransaction.narration || rawTransaction.description || 'Bank transaction').trim() || 'Bank transaction',
+    direction,
+    provider: 'mono',
+    type: direction,
+    date: postedAt,
+    rawRef: {
+      monoTransactionId: externalId,
+      balance: Number(rawTransaction.balance || 0),
+    },
+  };
+};
+
+const getSyncType = ({ syncType, isInitialSync, triggeredBy }) => {
+  if (syncType) return syncType;
+  if (isInitialSync) return 'initial_connect';
+  if (triggeredBy === 'webhook') return 'webhook';
+  if (triggeredBy === 'cron') return 'scheduled';
+  return 'manual';
+};
+
+const buildConnectionSnapshot = (connection) => ({
+  institutionName: connection.institutionName,
+  accountNumber: connection.accountNumber,
+  accountId: connection.accountId,
+  syncInterval: connection.syncInterval,
+});
+
+const getActiveSyncLog = async (connectionId) =>
+  SyncLog.findOne({
+    connectionId,
+    status: { $in: ACTIVE_SYNC_STATUSES },
+  }).sort({ createdAt: -1 });
+
+const saveConnectionDocument = async (connection) => {
+  if (typeof connection?.save === 'function') {
+    return connection.save();
+  }
+
+  return BankConnection.findByIdAndUpdate(connection._id, connection, {
+    new: true,
+  });
+};
+
+const createSyncLog = async (connection, userId, options = {}) => {
+  return SyncLog.create({
+    userId,
+    connectionId: connection._id,
+    syncType: getSyncType(options),
+    status: 'queued',
+    phase: 'queued',
+    syncParams: {
+      isInitialSync: Boolean(options.isInitialSync),
+      forceSync: Boolean(options.forceSync),
+      startDate: options.startDate || undefined,
+      endDate: options.endDate || undefined,
+    },
+    connectionSnapshot: buildConnectionSnapshot(connection),
+    metadata: {
+      source: 'mono',
+      triggeredBy: options.triggeredBy || 'user',
+      ipAddress: options.requestMeta?.ipAddress,
+      userAgent: options.requestMeta?.userAgent,
+    },
+  });
+};
+
+const getOrCreateCategory = async (userId, type, name, overrides = {}) => {
+  let category = await Category.findOne({
+    userId,
+    type,
+    name,
+    isActive: true,
+  }).select('_id name').lean();
+
+  if (category) return category;
 
   try {
-    // Get connections due for sync
-    const connections = forceSync 
-      ? await BankConnection.find({ isActive: true, autoSync: true })
-      : await BankConnection.getConnectionsForSync();
-
-    if (connections.length === 0) {
-      return {
-        success: true,
-        message: 'No connections due for sync',
-        synced: 0,
-        failed: 0,
-        skipped: 0
-      };
-    }
-
-    const results = {
-      synced: 0,
-      failed: 0,
-      skipped: 0,
-      errors: []
-    };
-
-    // Sync each connection
-    for (const connection of connections) {
-      try {
-        const syncResult = await syncBankConnection(connection._id, connection.userId);
-        
-        if (syncResult.success) {
-          results.synced++;
-        } else {
-          results.skipped++;
-        }
-      } catch (error) {
-        results.failed++;
-        results.errors.push({
-          connectionId: connection._id,
-          accountId: connection.accountId,
-          institutionName: connection.institutionName,
-          error: error.message
-        });
-        
-        // Update connection status to error
-        connection.syncStatus = 'error';
-        connection.lastSyncError = error.message;
-        await connection.save();
-      }
-    }
-
-    return {
-      success: true,
-      message: `Synced ${results.synced} of ${connections.length} connections`,
-      ...results,
-      totalConnections: connections.length
-    };
+    const created = await Category.create({
+      userId,
+      type,
+      name,
+      icon: overrides.icon || 'folder',
+      color: overrides.color || '#95A5A6',
+      source: 'system',
+      isActive: true,
+    });
+    return { _id: created._id, name: created.name };
   } catch (error) {
-    console.error('Error in syncAllConnections:', error);
-    throw new AppError('Failed to sync connections', 500);
+    if (error?.code !== 11000) {
+      throw error;
+    }
+
+    category = await Category.findOne({
+      userId,
+      type,
+      name,
+      isActive: true,
+    }).select('_id name').lean();
+
+    if (!category) throw error;
+    return category;
   }
 };
 
-/**
- * Sync a specific bank connection
- * Fetches new transactions since last sync
- * 
- * @param {String} connectionId - Bank connection ID
- * @param {String} userId - User ID
- * @param {Object} options - Sync options
- * @param {boolean} options.isInitialSync - Is this the first sync?
- * @param {Date} options.startDate - Override start date for sync
- * @param {Date} options.endDate - Override end date for sync
- * @returns {Promise<Object>} Sync result
- */
-const syncBankConnection = async (connectionId, userId, options = {}) => {
-  const { isInitialSync = false, startDate, endDate, syncLogId = null } = options;
+const resolveFallbackCategory = async (userId, type, isTransfer = false) => {
+  if (isTransfer) {
+    return getOrCreateCategory(userId, type, 'Transfer', {
+      icon: 'swap-horizontal',
+      color: '#16A34A',
+    });
+  }
+
+  return getOrCreateCategory(
+    userId,
+    type,
+    type === 'expense' ? 'Uncategorized Expense' : 'Uncategorized Income',
+    {
+      icon: 'folder',
+      color: '#95A5A6',
+    },
+  );
+};
+
+const resolveTransactionCategory = async (transaction, userId, options = {}) => {
+  const type = transaction.direction === 'credit' ? 'income' : 'expense';
+  const fallbackCategory = await resolveFallbackCategory(userId, type, Boolean(options.isTransfer));
+
+  if (options.isTransfer) {
+    return {
+      categoryId: fallbackCategory._id,
+      categoryName: fallbackCategory.name,
+      usedFallback: true,
+    };
+  }
 
   try {
-    // Fetch connection
-    const connection = await BankConnection.findOne({
-      _id: connectionId,
+    const categorization = await withTimeout(
+      aiCategorizationService.categorizeTransaction(
+        {
+          description: transaction.description,
+          amount: transaction.amount,
+          type,
+        },
+        userId,
+      ),
+      AI_TIMEOUT_MS,
+    );
+
+    if (categorization?.categoryId) {
+      return {
+        categoryId: categorization.categoryId,
+        categoryName: categorization.categoryName,
+        usedFallback: false,
+      };
+    }
+  } catch (error) {
+    console.warn('AI categorization skipped:', error.message);
+  }
+
+  return {
+    categoryId: fallbackCategory._id,
+    categoryName: fallbackCategory.name,
+    usedFallback: true,
+  };
+};
+
+const summarizeSyncResult = (result) => ({
+  totalFetched: result.totalFetched,
+  importedCount: result.importedCount,
+  newTransactions: result.importedCount,
+  duplicateCount: result.duplicateCount,
+  duplicates: result.duplicateCount,
+  transferCount: result.transferCount,
+  transfers: result.transferCount,
+  skippedCount: result.skippedCount,
+  failedCount: result.failedCount,
+  errorCount: result.failedCount + result.skippedCount,
+});
+
+const determineTerminalStatus = (result, wasCancelled) => {
+  if (wasCancelled) return 'cancelled';
+  if (result.failedCount > 0 || result.skippedCount > 0) {
+    return result.importedCount > 0 ? 'partial_success' : 'failed';
+  }
+  return 'completed';
+};
+
+const findExistingMappingIds = async (userId, connectionId, externalIds) => {
+  if (!externalIds.length) return new Set();
+
+  const existingMaps = await ImportedTransactionMap.find({
+    userId,
+    sourceType: 'bank_connection',
+    sourceRefId: connectionId,
+    externalId: { $in: externalIds },
+  })
+    .select('externalId')
+    .lean();
+
+  return new Set(existingMaps.map((mapping) => mapping.externalId));
+};
+
+const deduplicateTransactions = async (transactions, userId, connectionId) => {
+  const result = {
+    uniqueTransactions: [],
+    duplicateCount: 0,
+    skippedCount: 0,
+    skippedErrors: [],
+  };
+
+  const seenExternalIds = new Set();
+  const filtered = [];
+
+  for (const transaction of transactions) {
+    if (!transaction?.externalId) {
+      result.skippedCount += 1;
+      result.skippedErrors.push({
+        stage: 'normalizing',
+        message: 'Transaction missing provider external ID',
+      });
+      continue;
+    }
+
+    if (seenExternalIds.has(transaction.externalId)) {
+      result.duplicateCount += 1;
+      continue;
+    }
+
+    seenExternalIds.add(transaction.externalId);
+    filtered.push(transaction);
+  }
+
+  const existingExternalIds = await findExistingMappingIds(
+    userId,
+    connectionId,
+    filtered.map((transaction) => transaction.externalId),
+  );
+
+  for (const transaction of filtered) {
+    if (existingExternalIds.has(transaction.externalId)) {
+      result.duplicateCount += 1;
+      continue;
+    }
+
+    const duplicateCheck = await deduplicationService.checkDuplicate(
+      {
+        amount: transaction.amount,
+        date: transaction.postedAt,
+        description: transaction.description,
+        externalId: transaction.scopedExternalId,
+        type: transaction.direction === 'credit' ? 'income' : 'expense',
+      },
       userId,
-      isActive: true
+    );
+
+    if (duplicateCheck?.isDuplicate) {
+      result.duplicateCount += 1;
+      continue;
+    }
+
+    result.uniqueTransactions.push(transaction);
+  }
+
+  return result;
+};
+
+const buildMappingPayload = (base, transaction, savedTransaction) => ({
+  syncLogId: base.syncLogId,
+  userId: base.userId,
+  sourceType: 'bank_connection',
+  sourceRefId: base.connectionId,
+  provider: 'mono',
+  expenseId: base.kind === 'expense' ? savedTransaction._id : null,
+  incomeId: base.kind === 'income' ? savedTransaction._id : null,
+  externalId: transaction.externalId,
+  rawData: {
+    description: transaction.description,
+    amount: transaction.amount,
+    postedAt: transaction.postedAt,
+    direction: transaction.direction,
+    provider: 'mono',
+    monoTransactionId: transaction.externalId,
+  },
+});
+
+const persistSingleTransaction = async (transaction, context, options = {}) => {
+  const transactionType = transaction.direction === 'credit' ? 'income' : 'expense';
+  const category = await resolveTransactionCategory(transaction, context.userId, {
+    isTransfer: Boolean(options.isTransfer),
+  });
+
+  if (transactionType === 'expense') {
+    const expense = await Expense.create({
+      userId: context.userId,
+      categoryId: category.categoryId,
+      amount: transaction.amount,
+      description: transaction.description,
+      date: transaction.postedAt,
+      paymentMethod: 'bank_transfer',
+      isImported: true,
+      externalId: transaction.scopedExternalId,
+      isTransfer: Boolean(options.isTransfer),
+      transferPairId: options.transferPairId || null,
     });
 
-    if (!connection) {
-      throw new AppError('Bank connection not found or inactive', 404);
+    try {
+      await ImportedTransactionMap.create(
+        buildMappingPayload(
+          {
+            syncLogId: context.syncLogId,
+            userId: context.userId,
+            connectionId: context.connectionId,
+            kind: 'expense',
+          },
+          transaction,
+          expense,
+        ),
+      );
+    } catch (error) {
+      await Expense.deleteOne({ _id: expense._id });
+      throw error;
     }
 
-    // Update sync status
-    connection.syncStatus = 'syncing';
-    connection.syncAttempts = (connection.syncAttempts || 0) + 1;
-    await connection.save();
+    return {
+      kind: 'expense',
+      categoryName: category.categoryName,
+      usedFallbackCategory: category.usedFallback,
+      document: expense,
+    };
+  }
 
-    // Determine sync date range
-    const now = new Date();
-    let syncStartDate = startDate;
-    let syncEndDate = endDate || now;
+  const income = await Income.create({
+    userId: context.userId,
+    categoryId: category.categoryId,
+    amount: transaction.amount,
+    source: options.source || (options.isTransfer ? 'Transfer' : transaction.description),
+    description: transaction.description,
+    date: transaction.postedAt,
+    paymentMethod: 'bank_transfer',
+    isImported: true,
+    externalId: transaction.scopedExternalId,
+    isTransfer: Boolean(options.isTransfer),
+    transferPairId: options.transferPairId || null,
+  });
 
-    if (!syncStartDate) {
-      if (isInitialSync || !connection.lastSyncAt) {
-        // Initial sync: fetch last 3 months
-        syncStartDate = new Date();
-        syncStartDate.setMonth(syncStartDate.getMonth() - 3);
-      } else {
-        // Regular sync: fetch since last sync
-        syncStartDate = connection.lastSyncAt;
-      }
-    }
-
-    // Fetch transactions from Mono
-    const transactions = await monoService.getTransactions(
-      connection.accountId,
-      {
-        start: syncStartDate.toISOString().split('T')[0],
-        end: syncEndDate.toISOString().split('T')[0]
-      }
+  try {
+    await ImportedTransactionMap.create(
+      buildMappingPayload(
+        {
+          syncLogId: context.syncLogId,
+          userId: context.userId,
+          connectionId: context.connectionId,
+          kind: 'income',
+        },
+        transaction,
+        income,
+      ),
     );
+  } catch (error) {
+    await Income.deleteOne({ _id: income._id });
+    throw error;
+  }
 
-    if (!transactions || transactions.length === 0) {
-      // No new transactions
-      connection.syncStatus = 'active';
-      connection.lastSyncAt = now;
-      connection.nextSyncAt = calculateNextSync(connection.syncInterval);
-      connection.lastSyncError = null;
-      connection.syncAttempts = 0;
-      await connection.save();
+  return {
+    kind: 'income',
+    categoryName: category.categoryName,
+    usedFallbackCategory: category.usedFallback,
+    document: income,
+  };
+};
 
-      return {
-        success: true,
-        message: 'No new transactions',
-        totalFetched: transactions.length,
-        newTransactions: 0,
-        duplicates: 0,
-        transfers: 0
-      };
+const hasCancellationRequest = async (connectionId, syncLogId) => {
+  const [connection, syncLog] = await Promise.all([
+    BankConnection.findById(connectionId).select('cancelRequested').lean(),
+    SyncLog.findById(syncLogId).select('cancelRequested').lean(),
+  ]);
+
+  return Boolean(connection?.cancelRequested || syncLog?.cancelRequested);
+};
+
+const queueConnectionSync = async (connectionOrId, userId, options = {}) => {
+  const connection =
+    typeof connectionOrId === 'object' && connectionOrId?._id
+      ? connectionOrId
+      : await BankConnection.findOne({
+          _id: connectionOrId,
+          userId,
+          isActive: true,
+        });
+
+  if (!connection) {
+    throw new AppError('Bank connection not found or inactive', 404);
+  }
+
+  const existingSync = await getActiveSyncLog(connection._id);
+  if (existingSync) {
+    if (options.triggeredBy === 'webhook' && !connection.pendingResync) {
+      connection.pendingResync = true;
+      await BankConnection.findByIdAndUpdate(connection._id, {
+        pendingResync: true,
+      });
     }
 
-    // Deduplicate transactions
-    const { newTransactions, duplicates } = await deduplicateTransactions(
-      transactions,
-      userId,
-      connection._id
-    );
-
-    if (newTransactions.length === 0) {
-      // All transactions were duplicates
-      connection.syncStatus = 'active';
-      connection.lastSyncAt = now;
-      connection.nextSyncAt = calculateNextSync(connection.syncInterval);
-      connection.lastSyncError = null;
-      connection.syncAttempts = 0;
-      await connection.save();
-
-      return {
-        success: true,
-        message: 'All transactions already imported',
-        totalFetched: transactions.length,
-        newTransactions: 0,
-        duplicates: duplicates.length,
-        transfers: 0
-      };
-    }
-
-    // Detect transfers
-    const transferDetection = await transferDetectionService.detectTransfers(newTransactions);
-
-    // Save transactions
-    const savedCount = await saveTransactions(
-      transferDetection,
-      userId,
-      connection._id,
-      connection.accountId,
-      syncLogId
-    );
-
-    // Update connection sync status
-    connection.syncStatus = 'active';
-    connection.lastSyncAt = now;
-    connection.nextSyncAt = calculateNextSync(connection.syncInterval);
-    connection.lastSyncError = null;
-    connection.syncAttempts = 0;
-    await connection.save();
-
-    // Queue notification for any imported transactions
-    if (savedCount > 0) {
-      await addNotificationJob({
-        userId,
-        type: 'import_complete',
-        urgency: 'instant',
-        data: {
-          institutionName: connection.institutionName,
-          accountNumber: connection.accountNumber,
-          importedCount: savedCount,
-          duplicateCount: duplicates.length,
-          source: connection.institutionName || 'Bank Sync',
-          syncDate: now
-        }
+    if (existingSync.status === 'queued' && connection.syncStatus !== 'queued') {
+      connection.syncStatus = 'queued';
+      connection.currentSyncLogId = existingSync._id;
+      await BankConnection.findByIdAndUpdate(connection._id, {
+        syncStatus: 'queued',
+        currentSyncLogId: existingSync._id,
       });
     }
 
     return {
       success: true,
-      message: 'Sync completed successfully',
-      totalFetched: transactions.length,
-      newTransactions: savedCount,
-      duplicates: duplicates.length,
-      transfers: Array.isArray(transferDetection?.transfers)
-        ? transferDetection.transfers.length
-        : (transferDetection?.pairCount || transferDetection?.pairs?.length || 0),
-      connection: {
-        institutionName: connection.institutionName,
-        accountNumber: connection.accountNumber,
-        lastSyncAt: connection.lastSyncAt,
-        nextSyncAt: connection.nextSyncAt
+      existing: true,
+      status: existingSync.status === 'syncing' ? 'syncing' : 'queued',
+      syncLogId: existingSync._id,
+      connection,
+    };
+  }
+
+  const syncLog = await createSyncLog(connection, userId, options);
+
+  connection.syncStatus = 'queued';
+  connection.currentSyncLogId = syncLog._id;
+  connection.cancelRequested = false;
+  await saveConnectionDocument(connection);
+
+  const { addSyncJob } = require('../config/queue');
+  const job = await addSyncJob(
+    {
+      connectionId: String(connection._id),
+      userId: String(userId),
+      accountId: connection.accountId,
+      syncLogId: String(syncLog._id),
+      isInitialSync: Boolean(options.isInitialSync),
+      forceSync: Boolean(options.forceSync),
+      triggeredBy: options.triggeredBy || 'user',
+    },
+    { jobId: String(syncLog._id) },
+  );
+
+  syncLog.queueJobId = String(job.id);
+  await syncLog.save();
+
+  return {
+    success: true,
+    existing: false,
+    status: 'queued',
+    syncLogId: syncLog._id,
+    connection,
+  };
+};
+
+const runQueuedSync = async (job) => {
+  const { connectionId, userId, syncLogId, isInitialSync } = job.data;
+  const now = new Date();
+
+  const syncLog = await SyncLog.findOne({
+    _id: syncLogId,
+    userId,
+    connectionId,
+  });
+
+  if (!syncLog) {
+    throw new Error('Sync log not found for queued sync job');
+  }
+
+  const connection = await BankConnection.findOne({
+    _id: connectionId,
+    userId,
+    isActive: true,
+  });
+
+  if (!connection) {
+    await syncLog.markAsFailed(new Error('Bank connection not found or inactive'));
+    throw new Error('Bank connection not found or inactive');
+  }
+
+  if (await hasCancellationRequest(connection._id, syncLog._id)) {
+    connection.syncStatus = 'cancelled';
+    connection.currentSyncLogId = syncLog._id;
+    connection.cancelRequested = false;
+    connection.lastSyncAt = now;
+    connection.lastSyncError = 'Sync cancelled by user';
+    connection.lastSyncErrorSummary = 'Sync cancelled before it started';
+    await Promise.all([connection.save(), syncLog.markAsCancelled('Sync cancelled before it started')]);
+    return {
+      success: true,
+      status: 'cancelled',
+      syncLogId: syncLog._id,
+    };
+  }
+
+  syncLog.status = 'syncing';
+  syncLog.phase = 'fetching';
+  syncLog.startedAt = new Date();
+  syncLog.queueJobId = String(job.id);
+  await syncLog.save();
+
+  connection.syncStatus = 'syncing';
+  connection.currentSyncLogId = syncLog._id;
+  connection.cancelRequested = false;
+  connection.lastSyncAttemptAt = syncLog.startedAt;
+  await connection.save();
+
+  const result = {
+    totalFetched: 0,
+    importedCount: 0,
+    duplicateCount: 0,
+    transferCount: 0,
+    skippedCount: 0,
+    failedCount: 0,
+    errors: [],
+  };
+
+  const captureError = (errorItem) => {
+    if (result.errors.length < MAX_SYNC_ERRORS) {
+      result.errors.push(errorItem);
+    }
+  };
+
+  try {
+    let syncStartDate = syncLog.syncParams?.startDate ? new Date(syncLog.syncParams.startDate) : null;
+    const syncEndDate = syncLog.syncParams?.endDate ? new Date(syncLog.syncParams.endDate) : new Date();
+
+    if (!syncStartDate || Number.isNaN(syncStartDate.getTime())) {
+      if (isInitialSync || syncLog.syncType === 'initial_connect' || !connection.lastSuccessfulSyncAt) {
+        syncStartDate = new Date();
+        syncStartDate.setMonth(syncStartDate.getMonth() - 3);
+      } else {
+        syncStartDate = new Date(connection.lastSuccessfulSyncAt || connection.lastSyncAt);
       }
+    }
+
+    const monoTransactions = await monoService.getTransactions(connection.accountId, {
+      start: syncStartDate,
+      end: syncEndDate,
+    });
+
+    if (await hasCancellationRequest(connection._id, syncLog._id)) {
+      throw Object.assign(new Error('Sync cancelled by user'), { code: 'SYNC_CANCELLED' });
+    }
+
+    syncLog.phase = 'normalizing';
+    await syncLog.save();
+
+    const normalizedTransactions = monoTransactions
+      .map((transaction) => normalizeMonoTransaction(transaction, { connectionId: connection._id, userId }))
+      .filter(Boolean);
+
+    result.totalFetched = normalizedTransactions.length;
+
+    syncLog.results.totalFetched = result.totalFetched;
+    syncLog.phase = 'normalizing';
+    await syncLog.save();
+
+    const stageToPhase = {
+      normalize: 'normalizing',
+      deduplicate: 'deduplicating',
+      categorize: 'categorizing',
+      save: 'persisting',
+    };
+
+    const ingestResult = await ingestTransactions(
+      normalizedTransactions,
+      {
+        userId,
+        sourceType: 'bank_connection',
+        sourceRefId: connection._id,
+        syncLogId: syncLog._id,
+        provider: 'mono',
+        externalIdScope: `mono:${String(connection._id)}`,
+      },
+      {
+        onStage: async (stage) => {
+          if (await hasCancellationRequest(connection._id, syncLog._id)) {
+            throw Object.assign(new Error('Sync cancelled by user'), { code: 'SYNC_CANCELLED' });
+          }
+          syncLog.phase = stageToPhase[stage] || syncLog.phase;
+          await syncLog.save();
+        },
+      },
+    );
+
+    result.importedCount = ingestResult.importedCount;
+    result.duplicateCount = ingestResult.duplicateCount;
+    result.transferCount = ingestResult.transferCount;
+    result.skippedCount = ingestResult.skippedCount;
+    result.failedCount = ingestResult.failedCount;
+    ingestResult.issues.forEach(captureError);
+
+    const wasCancelled = await hasCancellationRequest(connection._id, syncLog._id);
+    const terminalStatus = determineTerminalStatus(result, wasCancelled);
+    const summary = summarizeSyncResult(result);
+
+    syncLog.errorList = result.errors;
+    if (terminalStatus === 'cancelled') {
+      await syncLog.markAsCancelled('Sync cancelled by user');
+    } else if (terminalStatus === 'partial_success') {
+      await syncLog.markAsPartial(summary);
+    } else if (terminalStatus === 'failed') {
+      const syncError = new Error(result.errors[0]?.message || 'Sync failed without importing any transactions');
+      await syncLog.markAsFailed(syncError);
+      syncLog.results = {
+        ...syncLog.results,
+        ...summary,
+      };
+      syncLog.errorList = result.errors;
+      await syncLog.save();
+    } else {
+      await syncLog.markAsCompleted(summary);
+      syncLog.errorList = result.errors;
+      await syncLog.save();
+    }
+
+    const followUpNeeded = Boolean(connection.pendingResync) && terminalStatus !== 'cancelled';
+
+    connection.syncStatus = terminalStatus;
+    connection.currentSyncLogId = syncLog._id;
+    connection.cancelRequested = false;
+    connection.pendingResync = false;
+    connection.lastSyncAt = new Date();
+    connection.nextSyncAt = connection.autoSync ? calculateNextSync(connection.syncInterval) : null;
+    connection.lastSyncError = terminalStatus === 'completed' ? null : (result.errors[0]?.message || null);
+    connection.lastSyncErrorSummary =
+      terminalStatus === 'completed'
+        ? null
+        : terminalStatus === 'partial_success'
+          ? `${result.importedCount} imported, ${result.failedCount + result.skippedCount} issue(s)`
+          : result.errors[0]?.message || 'Sync ended with errors';
+
+    if (['completed', 'partial_success'].includes(terminalStatus)) {
+      connection.lastSuccessfulSyncAt = connection.lastSyncAt;
+    }
+
+    await connection.save();
+
+    if (result.importedCount > 0) {
+      const { addNotificationJob } = require('../config/queue');
+      await addNotificationJob({
+        userId,
+        type: 'import_complete',
+        urgency: 'instant',
+        data: {
+          importedCount: result.importedCount,
+          duplicateCount: result.duplicateCount,
+          institutionName: connection.institutionName,
+          source: connection.institutionName || 'Bank Sync',
+        },
+      });
+    }
+
+    if (followUpNeeded) {
+      await queueConnectionSync(connection._id, userId, {
+        syncType: 'webhook',
+        triggeredBy: 'webhook',
+        forceSync: true,
+      });
+    }
+
+    return {
+      success: terminalStatus !== 'failed',
+      status: terminalStatus,
+      syncLogId: syncLog._id,
+      ...summary,
     };
   } catch (error) {
-    console.error('Error in syncBankConnection:', error);
+    const isCancelled = error.code === 'SYNC_CANCELLED' || /cancel/i.test(error.message || '');
+    const summary = summarizeSyncResult(result);
 
-    // Update connection with error status
-    try {
-      const connection = await BankConnection.findById(connectionId);
-      if (connection) {
-        connection.syncStatus = 'error';
-        connection.lastSyncError = error.message;
-        
-        // Implement exponential backoff for retry
-        const baseInterval = connection.syncInterval || 12; // hours
-        const backoffMultiplier = Math.min(connection.syncAttempts || 1, 5); // Max 5x backoff
-        const retryHours = baseInterval * backoffMultiplier;
-        
-        connection.nextSyncAt = new Date(Date.now() + retryHours * 60 * 60 * 1000);
-        await connection.save();
-      }
-    } catch (updateError) {
-      console.error('Failed to update connection status:', updateError);
+    syncLog.results = {
+      ...syncLog.results,
+      ...summary,
+    };
+    syncLog.errorList = result.errors;
+
+    if (isCancelled) {
+      await syncLog.markAsCancelled('Sync cancelled by user');
+      connection.syncStatus = 'cancelled';
+      connection.lastSyncError = 'Sync cancelled by user';
+      connection.lastSyncErrorSummary = 'Sync cancelled by user';
+    } else {
+      await syncLog.markAsFailed(error);
+      syncLog.results = {
+        ...syncLog.results,
+        ...summary,
+      };
+      syncLog.errorList = result.errors;
+      await syncLog.save();
+      connection.syncStatus = 'failed';
+      connection.lastSyncError = error.message;
+      connection.lastSyncErrorSummary = error.message;
+    }
+
+    connection.currentSyncLogId = syncLog._id;
+    connection.cancelRequested = false;
+    connection.lastSyncAt = new Date();
+    connection.nextSyncAt = connection.autoSync ? calculateNextSync(connection.syncInterval) : null;
+    await connection.save();
+
+    if (isCancelled) {
+      return {
+        success: true,
+        status: 'cancelled',
+        syncLogId: syncLog._id,
+        ...summary,
+      };
     }
 
     throw error;
   }
 };
 
-/**
- * Deduplicate transactions against existing database records
- * 
- * @param {Array} transactions - Transactions from Mono
- * @param {String} userId - User ID
- * @param {String} connectionId - Bank connection ID
- * @returns {Promise<Object>} New transactions and duplicates
- */
-const deduplicateTransactions = async (transactions, userId, connectionId) => {
-  const newTransactions = [];
-  const duplicates = [];
+const syncAllConnections = async (options = {}) => {
+  const connections = options.forceSync
+    ? await BankConnection.find({ isActive: true, autoSync: true })
+    : await BankConnection.getConnectionsForSync();
 
-  for (const transaction of transactions) {
-    const externalId = String(transaction?._id || transaction?.id || transaction?.reference || '').trim();
-    if (!externalId) {
-      duplicates.push(transaction);
-      continue;
-    }
-
-    // Check if transaction already imported
-    const existingMap = await ImportedTransactionMap.findOne({
-      userId,
-      externalId
-    });
-
-    if (existingMap) {
-      duplicates.push(transaction);
-      continue;
-    }
-
-    const [existingExpense, existingIncome] = await Promise.all([
-      Expense.exists({ userId, externalId }),
-      Income.exists({ userId, externalId }),
-    ]);
-
-    if (existingExpense || existingIncome) {
-      duplicates.push(transaction);
-      continue;
-    }
-
-    // Check for duplicate by amount, date, description
-    const duplicateCheck = await deduplicationService.checkDuplicate({
-      amount: Math.abs(transaction.amount),
-      date: new Date(transaction.date),
-      description: transaction.narration,
-      userId,
-      type: transaction.type === 'debit' ? 'expense' : 'income',
-      externalId,
-    });
-
-    if (duplicateCheck?.isDuplicate) {
-      duplicates.push(transaction);
-      continue;
-    }
-
-    newTransactions.push(transaction);
-  }
-
-  return { newTransactions, duplicates };
-};
-
-/**
- * Save transactions to database
- * 
- * @param {Object} transferDetection - Transfer detection result
- * @param {String} userId - User ID
- * @param {String} connectionId - Bank connection ID
- * @param {String} accountId - Mono account ID
- * @returns {Promise<Number>} Count of saved transactions
- */
-const saveTransactions = async (transferDetection, userId, connectionId, accountId, syncLogId = null) => {
-  let savedCount = 0;
-  const fallbackCategoryCache = {
-    expense: null,
-    income: null,
-  };
-
-  const getFallbackCategoryId = async (type) => {
-    if (fallbackCategoryCache[type]) return fallbackCategoryCache[type];
-
-    const category = await Category.findOne({ userId, type }).select('_id').lean();
-    fallbackCategoryCache[type] = category?._id || null;
-    return fallbackCategoryCache[type];
-  };
-
-  const transactions = Array.isArray(transferDetection?.transactions)
-    ? transferDetection.transactions
-    : [
-        ...(Array.isArray(transferDetection?.unmatchedDebits) ? transferDetection.unmatchedDebits : []),
-        ...(Array.isArray(transferDetection?.unmatchedCredits) ? transferDetection.unmatchedCredits : []),
-      ];
-  const transfers = Array.isArray(transferDetection?.transfers) ? transferDetection.transfers : [];
-  const transferPairs = Array.isArray(transferDetection?.transferPairs)
-    ? transferDetection.transferPairs
-    : Array.isArray(transferDetection?.pairs)
-      ? transferDetection.pairs
-      : [];
-
-  for (const transaction of transactions) {
-    try {
-      // Determine transaction type
-      const type = transaction.type === 'debit' ? 'expense' : 'income';
-      
-      // Use AI to categorize the transaction
-      let categoryId = null;
-      let categoryName = 'Uncategorized';
-      
-      try {
-        const categorization = await aiCategorizationService.categorizeTransaction(
-          {
-            description: transaction.narration || 'Bank transaction',
-            amount: Math.abs(transaction.amount),
-            type: type
-          },
-          userId
-        );
-        
-        if (categorization && categorization.categoryId) {
-          categoryId = categorization.categoryId;
-          categoryName = categorization.categoryName;
-          
-          // Log categorization confidence for monitoring
-          console.log(`AI categorized transaction: "${transaction.narration}" → ${categoryName} (confidence: ${categorization.confidence})`);
-        }
-      } catch (categorizationError) {
-        console.error('AI categorization failed, using fallback:', categorizationError);
-        // Fall back to default category if AI categorization fails
-      }
-
-      if (!categoryId) {
-        categoryId = await getFallbackCategoryId(type);
-      }
-
-      if (!categoryId) {
-        console.warn(`Skipping transaction due to missing ${type} category for user ${userId}`);
-        continue;
-      }
-      
-      const transactionData = {
-        userId,
-        amount: Math.abs(transaction.amount),
-        description: transaction.narration || 'Bank transaction',
-        date: new Date(transaction.date),
-        categoryId: categoryId, // Use AI-suggested category
-        importJobId: syncLogId || null,
-        isImported: true,
-        externalId: transaction._id,
-        paymentMethod: 'bank_transfer',
-        metadata: {
-          balance: transaction.balance,
-          reference: transaction.reference,
-          monoTransactionId: transaction._id,
-          connectionId: connectionId.toString(),
-          accountId,
-          aiCategorized: categoryId ? true : false,
-          aiCategory: categoryName,
-          rawData: transaction
-        }
-      };
-
-      // Check if transaction is a transfer
-      const transferInfo = transfers.find(t => t.transactionId === transaction._id);
-      if (transferInfo) {
-        transactionData.isTransfer = true;
-        transactionData.transferConfidence = transferInfo.confidence;
-        transactionData.metadata.transferType = transferInfo.type;
-      }
-
-      // Save as Expense or Income based on type
-      let savedTransaction;
-      if (transaction.type === 'debit') {
-        savedTransaction = await Expense.create(transactionData);
-      } else {
-        savedTransaction = await Income.create(transactionData);
-      }
-
-      savedCount++;
-
-      // Best-effort map creation for audit/undo tooling compatibility.
-      try {
-        await ImportedTransactionMap.create({
-          importJobId: syncLogId || connectionId,
-          userId,
-          expenseId: transaction.type === 'debit' ? savedTransaction._id : null,
-          incomeId: transaction.type === 'debit' ? null : savedTransaction._id,
-          externalId: transaction._id,
-          rawData: {
-            source: 'mono_sync',
-            connectionId,
-            syncLogId: syncLogId || null,
-            accountId,
-            importedAt: new Date(),
-            transaction,
-          },
-        });
-      } catch (mappingError) {
-        console.warn('ImportedTransactionMap write skipped:', mappingError.message);
-      }
-    } catch (error) {
-      console.error('Error saving transaction:', error);
-      // Continue with next transaction
-    }
-  }
-
-  // Link transfer pairs
-  for (const pair of transferPairs) {
-    try {
-      const sourceExternalId = pair?.sourceId || pair?.debit?._id || pair?.debit?.reference;
-      const destinationExternalId = pair?.destinationId || pair?.credit?._id || pair?.credit?.reference;
-      if (!sourceExternalId || !destinationExternalId) {
-        continue;
-      }
-
-      const sourceMap = await ImportedTransactionMap.findOne({
-        externalId: sourceExternalId,
-        userId
-      });
-      const destMap = await ImportedTransactionMap.findOne({
-        externalId: destinationExternalId,
-        userId
-      });
-
-      if (sourceMap && destMap) {
-        // Link transactions
-        const sourceExpenseId = sourceMap.expenseId || null;
-        const sourceIncomeId = sourceMap.incomeId || null;
-        const destExpenseId = destMap.expenseId || null;
-        const destIncomeId = destMap.incomeId || null;
-
-        if (sourceExpenseId) {
-          await Expense.findByIdAndUpdate(sourceExpenseId, {
-            transferPairId: destIncomeId || destExpenseId
-          });
-        }
-        if (sourceIncomeId) {
-          await Income.findByIdAndUpdate(sourceIncomeId, {
-            transferPairId: destExpenseId || destIncomeId
-          });
-        }
-
-        if (destExpenseId) {
-          await Expense.findByIdAndUpdate(destExpenseId, {
-            transferPairId: sourceIncomeId || sourceExpenseId
-          });
-        }
-        if (destIncomeId) {
-          await Income.findByIdAndUpdate(destIncomeId, {
-            transferPairId: sourceExpenseId || sourceIncomeId
-          });
-        }
-      }
-    } catch (error) {
-      console.error('Error linking transfer pair:', error);
-    }
-  }
-
-  return savedCount;
-};
-
-/**
- * Calculate next sync time based on interval
- * 
- * @param {Number} intervalHours - Sync interval in hours (default: 12)
- * @returns {Date} Next sync timestamp
- */
-const calculateNextSync = (intervalHours = 12) => {
-  const now = new Date();
-  return new Date(now.getTime() + intervalHours * 60 * 60 * 1000);
-};
-
-/**
- * Sync a specific user's connections
- * 
- * @param {String} userId - User ID
- * @param {Object} options - Sync options
- * @returns {Promise<Object>} Sync results
- */
-const syncUserConnections = async (userId, options = {}) => {
-  try {
-    const connections = await BankConnection.find({
-      userId,
-      isActive: true,
-      autoSync: true
-    });
-
-    if (connections.length === 0) {
-      return {
-        success: true,
-        message: 'No active connections found',
-        synced: 0,
-        failed: 0
-      };
-    }
-
-    const results = {
-      synced: 0,
-      failed: 0,
-      errors: []
-    };
-
-    for (const connection of connections) {
-      try {
-        await syncBankConnection(connection._id, userId, options);
-        results.synced++;
-      } catch (error) {
-        results.failed++;
-        results.errors.push({
-          connectionId: connection._id,
-          institutionName: connection.institutionName,
-          error: error.message
-        });
-      }
-    }
-
+  if (connections.length === 0) {
     return {
       success: true,
-      message: `Synced ${results.synced} of ${connections.length} connections`,
-      ...results,
-      totalConnections: connections.length
+      message: 'No connections due for sync',
+      totalConnections: 0,
+      synced: 0,
+      failed: 0,
+      skipped: 0,
     };
-  } catch (error) {
-    console.error('Error in syncUserConnections:', error);
-    throw new AppError('Failed to sync user connections', 500);
   }
+
+  let synced = 0;
+  let skipped = 0;
+  let failed = 0;
+  const errors = [];
+
+  for (const connection of connections) {
+    try {
+      const queued = await queueConnectionSync(connection, connection.userId, {
+        syncType: 'scheduled',
+        triggeredBy: 'cron',
+        forceSync: Boolean(options.forceSync),
+      });
+
+      if (queued.existing) {
+        skipped += 1;
+      } else {
+        synced += 1;
+      }
+    } catch (error) {
+      failed += 1;
+      errors.push({
+        connectionId: connection._id,
+        institutionName: connection.institutionName,
+        error: error.message,
+      });
+    }
+  }
+
+  return {
+    success: true,
+    message: `Queued ${synced} sync(s)`,
+    totalConnections: connections.length,
+    synced,
+    failed,
+    skipped,
+    errors,
+  };
 };
 
-/**
- * Get sync statistics
- * 
- * @returns {Promise<Object>} Sync statistics
- */
+const syncUserConnections = async (userId, options = {}) => {
+  const connections = await BankConnection.find({
+    userId,
+    isActive: true,
+    autoSync: true,
+  });
+
+  if (!connections.length) {
+    return {
+      success: true,
+      message: 'No active connections found',
+      totalConnections: 0,
+      synced: 0,
+      failed: 0,
+      skipped: 0,
+      errors: [],
+    };
+  }
+
+  let synced = 0;
+  let skipped = 0;
+  let failed = 0;
+  const errors = [];
+
+  for (const connection of connections) {
+    try {
+      const queued = await queueConnectionSync(connection, userId, {
+        syncType: options.syncType || 'manual',
+        triggeredBy: options.triggeredBy || 'user',
+        forceSync: true,
+      });
+
+      if (queued.existing) {
+        skipped += 1;
+      } else {
+        synced += 1;
+      }
+    } catch (error) {
+      failed += 1;
+      errors.push({
+        connectionId: connection._id,
+        institutionName: connection.institutionName,
+        error: error.message,
+      });
+    }
+  }
+
+  return {
+    success: true,
+    message: `Queued ${synced} sync(s)`,
+    totalConnections: connections.length,
+    synced,
+    failed,
+    skipped,
+    errors,
+  };
+};
+
 const getSyncStats = async () => {
-  try {
-    const totalConnections = await BankConnection.countDocuments({ isActive: true });
-    const autoSyncEnabled = await BankConnection.countDocuments({ 
-      isActive: true, 
-      autoSync: true 
-    });
-    const syncingNow = await BankConnection.countDocuments({ 
-      syncStatus: 'syncing' 
-    });
-    const errorConnections = await BankConnection.countDocuments({ 
-      syncStatus: 'error',
-      isActive: true
-    });
-    const dueForSync = await BankConnection.countDocuments({
-      isActive: true,
-      autoSync: true,
-      nextSyncAt: { $lte: new Date() }
-    });
+  const totalConnections = await BankConnection.countDocuments({ isActive: true });
+  const autoSyncEnabled = await BankConnection.countDocuments({ isActive: true, autoSync: true });
+  const syncingNow = await BankConnection.countDocuments({ isActive: true, syncStatus: { $in: ['queued', 'syncing'] } });
+  const errorConnections = await BankConnection.countDocuments({ isActive: true, syncStatus: { $in: ['failed', 'error'] } });
+  const dueForSync = await BankConnection.countDocuments({
+    isActive: true,
+    autoSync: true,
+    nextSyncAt: { $lte: new Date() },
+    syncStatus: { $nin: ['queued', 'syncing', 'disconnected', 'reauth_required'] },
+  });
+
+  return {
+    totalConnections,
+    autoSyncEnabled,
+    syncingNow,
+    errorConnections,
+    dueForSync,
+    lastChecked: new Date(),
+  };
+};
+
+const cancelQueuedOrActiveSync = async (connectionId, userId) => {
+  const connection = await BankConnection.findOne({
+    _id: connectionId,
+    userId,
+  });
+
+  if (!connection) {
+    throw new AppError('Bank connection not found', 404);
+  }
+
+  const syncLog = connection.currentSyncLogId
+    ? await SyncLog.findOne({
+        _id: connection.currentSyncLogId,
+        userId,
+      })
+    : await getActiveSyncLog(connection._id);
+
+  if (!syncLog || !ACTIVE_SYNC_STATUSES.includes(syncLog.status)) {
+    throw new AppError('No active or queued sync found for this connection', 400);
+  }
+
+  if (syncLog.status === 'queued') {
+    const { syncQueue } = require('../config/queue');
+    const job = await syncQueue.getJob(syncLog.queueJobId || String(syncLog._id));
+    if (job) {
+      await job.remove();
+    }
+
+    await syncLog.markAsCancelled('Sync cancelled before it started');
+
+    connection.syncStatus = 'cancelled';
+    connection.cancelRequested = false;
+    connection.currentSyncLogId = syncLog._id;
+    connection.lastSyncAt = new Date();
+    connection.lastSyncError = 'Sync cancelled by user';
+    connection.lastSyncErrorSummary = 'Sync cancelled before it started';
+    await connection.save();
 
     return {
-      totalConnections,
-      autoSyncEnabled,
-      syncingNow,
-      errorConnections,
-      dueForSync,
-      lastChecked: new Date()
+      connectionId: connection._id,
+      syncLogId: syncLog._id,
+      status: 'cancelled',
     };
-  } catch (error) {
-    console.error('Error getting sync stats:', error);
-    throw new AppError('Failed to get sync statistics', 500);
   }
+
+  syncLog.cancelRequested = true;
+  await syncLog.save();
+
+  connection.cancelRequested = true;
+  await connection.save();
+
+  return {
+    connectionId: connection._id,
+    syncLogId: syncLog._id,
+    status: 'cancelling',
+  };
+};
+
+const getSyncLogDetails = async (syncLogId, userId) => {
+  const syncLog = await SyncLog.findOne({
+    _id: syncLogId,
+    userId,
+  })
+    .populate('connectionId', 'institutionName accountNumber syncStatus lastSyncAt lastSuccessfulSyncAt')
+    .lean();
+
+  if (!syncLog) {
+    throw new AppError('Sync log not found', 404);
+  }
+
+  return syncLog;
 };
 
 module.exports = {
+  ACTIVE_SYNC_STATUSES,
+  calculateNextSync,
+  queueConnectionSync,
+  runQueuedSync,
   syncAllConnections,
-  syncBankConnection,
   syncUserConnections,
   getSyncStats,
-  calculateNextSync
+  cancelQueuedOrActiveSync,
+  getSyncLogDetails,
+  buildScopedExternalId,
 };

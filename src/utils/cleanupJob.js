@@ -2,6 +2,7 @@
  * Cleanup Job - Removes unverified users older than 24 hours
  */
 
+const mongoose = require('mongoose');
 const User = require('../models/User');
 
 /**
@@ -9,6 +10,11 @@ const User = require('../models/User');
  */
 const runCleanup = async () => {
   try {
+    if (mongoose.connection.readyState !== 1) {
+      console.warn('⚠️  Skipping cleanup job because MongoDB is not connected yet');
+      return;
+    }
+
     console.log('🧹 Running cleanup job for unverified users...');
     await User.cleanupUnverifiedUsers();
   } catch (error) {
@@ -25,9 +31,10 @@ const startCleanupJob = () => {
   
   // Run every 6 hours
   const SIX_HOURS = 6 * 60 * 60 * 1000;
-  setInterval(runCleanup, SIX_HOURS);
+  const intervalId = setInterval(runCleanup, SIX_HOURS);
   
   console.log('✅ Cleanup job scheduled to run every 6 hours');
+  return intervalId;
 };
 
 module.exports = { runCleanup, startCleanupJob };

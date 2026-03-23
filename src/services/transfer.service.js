@@ -5,14 +5,20 @@ const { containsTransferKeywords, extractAccountNumbers } = require('../utils/st
  * Identifies transfer pairs (expense + income) within imported transactions
  */
 
+const getTransactionDirection = (transaction) => transaction.direction || transaction.type;
+const getTransactionDate = (transaction) => {
+  const value = transaction.postedAt || transaction.date;
+  return value instanceof Date ? value : new Date(value);
+};
+
 /**
  * Detect transfers in a list of transactions
  * @param {Array} transactions - List of transactions with type field
  * @returns {Object} Detection result with pairs and singles
  */
 const detectTransfers = (transactions) => {
-  const debits = transactions.filter(t => t.type === 'debit');
-  const credits = transactions.filter(t => t.type === 'credit');
+  const debits = transactions.filter((t) => getTransactionDirection(t) === 'debit');
+  const credits = transactions.filter((t) => getTransactionDirection(t) === 'credit');
   
   const pairs = [];
   const matchedDebitIndices = new Set();
@@ -84,7 +90,7 @@ const isPotentialTransferPair = (debit, credit) => {
   }
   
   // Rule 2: Same date or within 1 day
-  const timeDiff = Math.abs(credit.date.getTime() - debit.date.getTime());
+  const timeDiff = Math.abs(getTransactionDate(credit).getTime() - getTransactionDate(debit).getTime());
   const dayDiff = timeDiff / (1000 * 60 * 60 * 24);
   
   if (dayDiff > 1) {
@@ -115,7 +121,7 @@ const calculatePairConfidence = (debit, credit) => {
   }
   
   // Same date: +30, next day: +20, within 1 day: +10
-  const timeDiff = Math.abs(credit.date.getTime() - debit.date.getTime());
+  const timeDiff = Math.abs(getTransactionDate(credit).getTime() - getTransactionDate(debit).getTime());
   const dayDiff = timeDiff / (1000 * 60 * 60 * 24);
   
   if (dayDiff === 0) {
@@ -175,12 +181,14 @@ const markAsTransfers = (pairs) => {
   for (const pair of pairs) {
     markedTransactions.push({
       ...pair.debit,
+      type: getTransactionDirection(pair.debit),
       isTransfer: true,
       transferPairId: null // Will be set after income is saved
     });
     
     markedTransactions.push({
       ...pair.credit,
+      type: getTransactionDirection(pair.credit),
       isTransfer: true,
       transferPairId: null // Will be set after expense is saved
     });
@@ -198,7 +206,7 @@ const markAsTransfers = (pairs) => {
 const createTransferSummary = (debit, credit) => {
   return {
     amount: debit.amount,
-    date: debit.date,
+    date: getTransactionDate(debit),
     fromAccount: extractAccountNumbers(debit.description)[0] || 'Unknown',
     toAccount: extractAccountNumbers(credit.description)[0] || 'Unknown',
     debitDescription: debit.description,
@@ -223,7 +231,7 @@ const validateTransferPair = (debit, credit) => {
   }
   
   // Check dates
-  const timeDiff = Math.abs(credit.date.getTime() - debit.date.getTime());
+  const timeDiff = Math.abs(getTransactionDate(credit).getTime() - getTransactionDate(debit).getTime());
   const dayDiff = timeDiff / (1000 * 60 * 60 * 24);
   
   if (dayDiff > 1) {

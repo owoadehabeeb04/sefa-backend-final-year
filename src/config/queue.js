@@ -87,10 +87,11 @@ const addImportJob = async (data) => {
  * @param {Object} data - Job data
  * @returns {Promise<Job>}
  */
-const addSyncJob = async (data) => {
+const addSyncJob = async (data, options = {}) => {
   return await syncQueue.add('sync-transactions', data, {
     priority: data.priority || 2,
-    timeout: 180000 // 3 minutes
+    timeout: 180000, // 3 minutes
+    ...(options.jobId ? { jobId: options.jobId } : {})
   });
 };
 

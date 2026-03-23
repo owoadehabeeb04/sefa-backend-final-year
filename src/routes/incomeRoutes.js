@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { authenticate } = require('../middleware/auth');
-const { validateIncome } = require('../middleware/validators');
+const { validateIncome, validateIncomeUpdate } = require('../middleware/validators');
 const incomeController = require('../controllers/incomeController');
 
 // All routes require authentication
@@ -40,7 +40,7 @@ router.get('/:id', incomeController.getIncomeById);
  * @desc    Update an income entry
  * @access  Private
  */
-router.put('/:id', incomeController.updateIncome);
+router.put('/:id', validateIncomeUpdate, incomeController.updateIncome);
 
 /**
  * @route   DELETE /api/v1/income/:id

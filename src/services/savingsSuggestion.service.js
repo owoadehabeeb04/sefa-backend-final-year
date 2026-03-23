@@ -2,14 +2,27 @@ const Expense = require('../models/Expense');
 const Income = require('../models/Income');
 const Category = require('../models/Category');
 const Groq = require('groq-sdk');
+const mongoose = require('mongoose');
 const moment = require('moment');
 
 // Initialize Groq client
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY
-});
+const groq = process.env.GROQ_API_KEY
+  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
+  : null;
 
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+
+const shouldUseGroq = () =>
+  Boolean(groq)
+  && process.env.GROQ_API_KEY !== 'test-groq-key'
+  && process.env.NODE_ENV !== 'test';
+
+function normalizeUserId(userId) {
+  if (mongoose.Types.ObjectId.isValid(userId)) {
+    return new mongoose.Types.ObjectId(String(userId));
+  }
+  return userId;
+}
 
 /**
  * Savings Suggestion Service
@@ -75,13 +88,14 @@ async function generateSavingsSuggestions(userId, options = {}) {
  * @returns {Promise<Array>} Category savings opportunities
  */
 async function findCategorySavingsOpportunities(userId, months) {
+  const normalizedUserId = normalizeUserId(userId);
   const startDate = moment().subtract(months, 'months').startOf('month').toDate();
   const endDate = moment().endOf('day').toDate();
 
   const categorySpending = await Expense.aggregate([
     {
       $match: {
-        userId: userId,
+        userId: normalizedUserId,
         date: { $gte: startDate, $lte: endDate }
       }
     },
@@ -279,13 +293,14 @@ async function analyzeHabitualSpending(userId, months) {
  * @returns {Promise<Array>} Frequency reduction suggestions
  */
 async function findFrequencyReductionOpportunities(userId, months) {
+  const normalizedUserId = normalizeUserId(userId);
   const startDate = moment().subtract(months, 'months').startOf('month').toDate();
   const endDate = moment().endOf('day').toDate();
 
   const categoryFrequency = await Expense.aggregate([
     {
       $match: {
-        userId: userId,
+        userId: normalizedUserId,
         date: { $gte: startDate, $lte: endDate }
       }
     },
@@ -421,6 +436,10 @@ async function calculateTotalSavingsPotential(userId, months) {
  */
 async function generateAISavingsAdvice(opportunities, totalPotential) {
   try {
+    if (!shouldUseGroq()) {
+      return getFallbackSavingsAdvice(totalPotential);
+    }
+
     const topOpportunities = opportunities.slice(0, 3).map(opp =>
       `${opp.category}: Save ₦${opp.potentialMonthlySavings.toLocaleString()}/month by reducing ${opp.suggestedReduction}%`
     ).join(', ');

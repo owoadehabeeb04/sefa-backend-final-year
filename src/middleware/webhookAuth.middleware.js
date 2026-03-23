@@ -32,8 +32,9 @@ const verifyMonoWebhook = (req, res, next) => {
       });
     }
     
-    // Get raw body
-    const payload = JSON.stringify(req.body);
+    const payload = req.rawBody instanceof Buffer
+      ? req.rawBody
+      : Buffer.from(JSON.stringify(req.body || {}));
     
     // Calculate expected signature
     const expectedSignature = crypto

@@ -34,6 +34,13 @@ router.post('/all', syncController.syncAllUserConnections);
 router.get('/history', syncController.getSyncHistory);
 
 /**
+ * @route   GET /api/v1/sync/logs/:id
+ * @desc    Get a specific sync log detail
+ * @access  Private
+ */
+router.get('/logs/:id', syncController.getSyncLogDetails);
+
+/**
  * @route   DELETE /api/v1/sync/history/:id/transactions
  * @desc    Clear transactions imported by a specific sync log
  * @access  Private

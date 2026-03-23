@@ -39,7 +39,6 @@ const categorySchema = new mongoose.Schema({
 
 // Index for faster queries
 categorySchema.index({ userId: 1, type: 1, isActive: 1 });
-categorySchema.index({ userId: 1, name: 1 }, { unique: true });
+categorySchema.index({ userId: 1, type: 1, name: 1 }, { unique: true });
 
 module.exports = mongoose.model('Category', categorySchema);
-

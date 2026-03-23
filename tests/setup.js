@@ -3,6 +3,11 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
 
 let mongoServer;
 
+process.env.NODE_ENV = 'test';
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret';
+process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
+process.env.GROQ_API_KEY = process.env.GROQ_API_KEY || 'test-groq-key';
+
 // Setup: Connect to in-memory MongoDB before all tests
 beforeAll(async () => {
   // Close any existing connections
@@ -15,10 +20,7 @@ beforeAll(async () => {
   const mongoUri = mongoServer.getUri();
 
   // Connect to the in-memory database
-  await mongoose.connect(mongoUri, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-  });
+  await mongoose.connect(mongoUri);
 
   console.log('Test database connected');
 });
@@ -44,4 +46,3 @@ afterAll(async () => {
 
   console.log('Test database disconnected');
 });
-

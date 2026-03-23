@@ -3,7 +3,7 @@ const Income = require('../models/Income');
 const User = require('../models/User');
 const aiService = require('../services/aiService');
 const { successResponse, errorResponse } = require('../utils/response');
-const { startOfMonth, endOfMonth, startOfWeek, endOfWeek, startOfDay, endOfDay, startOfYear, endOfYear, subMonths, subWeeks, subYears, differenceInDays } = require('date-fns');
+const { startOfMonth, endOfMonth, startOfWeek, endOfWeek, startOfDay, endOfDay, startOfYear, endOfYear, subMonths, subWeeks, subYears, differenceInDays, getDaysInMonth, isSameMonth } = require('date-fns');
 
 /**
  * @swagger
@@ -206,15 +206,17 @@ exports.getDashboardSummary = async (req, res, next) => {
     }));
 
     // Build budget summary: scale monthly budget by exact period length (days)
-    const DAYS_PER_MONTH = 30;
     const periodDays = Math.max(1, differenceInDays(endDate, startDate) + 1);
     const isCurrentMonth = period === 'month';
+    const budgetBaseDays = (period === 'month' || isSameMonth(startDate, endDate))
+      ? getDaysInMonth(startDate)
+      : 30;
 
     let budget = null;
     let thisMonthBudget = null;
 
     if (monthlyBudgetLimit != null && monthlyBudgetLimit > 0) {
-      const periodLimit = Math.round(monthlyBudgetLimit * (periodDays / DAYS_PER_MONTH));
+      const periodLimit = Math.round(monthlyBudgetLimit * (periodDays / budgetBaseDays));
       const used = totalExpenses;
       const left = Math.max(0, periodLimit - used);
       const percentUsed = periodLimit > 0 ? ((used / periodLimit) * 100).toFixed(1) : 0;

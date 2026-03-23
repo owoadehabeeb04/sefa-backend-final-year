@@ -53,8 +53,7 @@ exports.register = async (req, res, next) => {
     });
 
     // Generate OTP for email verification
-    const useDefault = process.env.NODE_ENV === 'development';
-    const otp = user.generateOTP(useDefault);
+    const otp = user.generateOTP();
     await user.save();
 
     // Send OTP via email
@@ -68,17 +67,12 @@ exports.register = async (req, res, next) => {
       isVerified: user.isVerified
     };
 
-    // Prepare response
-    const otpResponse = process.env.NODE_ENV === 'development' 
-      ? { otp, expiresIn: `${otpService.getOTPExpiryMinutes()} minutes` } 
-      : { message: 'OTP sent to your email' };
-
     return successResponse(
       res,
       {
         user: userData,
         requiresVerification: true,
-        ...otpResponse
+        expiresIn: `${otpService.getOTPExpiryMinutes()} minutes`
       },
       'Registration successful. Please verify your email with the OTP sent.',
       201
@@ -288,21 +282,18 @@ exports.forgotPassword = async (req, res, next) => {
     }
 
     // Generate OTP using OTP service
-    const useDefault = process.env.NODE_ENV === 'development';
-    const otp = user.generateOTP(useDefault);
+    const otp = user.generateOTP();
     await user.save();
 
     // Send OTP via email using OTP service
     await otpService.sendOTPEmail(user.email, otp, 'password-reset');
 
-    // Prepare response
-    const otpResponse = process.env.NODE_ENV === 'development' 
-      ? { otp, expiresIn: `${otpService.getOTPExpiryMinutes()} minutes` } 
-      : { message: 'OTP sent to your email' };
-
     return successResponse(
       res,
-      otpResponse,
+      {
+        message: 'OTP sent to your email',
+        expiresIn: `${otpService.getOTPExpiryMinutes()} minutes`
+      },
       'OTP sent successfully. Please check your email.'
     );
   } catch (error) {
@@ -465,21 +456,18 @@ exports.resendOTP = async (req, res, next) => {
     }
 
     // Generate new OTP
-    const useDefault = process.env.NODE_ENV === 'development';
-    const otp = user.generateOTP(useDefault);
+    const otp = user.generateOTP();
     await user.save();
 
     // Send OTP via email
     await otpService.sendOTPEmail(user.email, otp, 'email-verification');
 
-    // Prepare response
-    const otpResponse = process.env.NODE_ENV === 'development' 
-      ? { otp, expiresIn: `${otpService.getOTPExpiryMinutes()} minutes` } 
-      : { message: 'OTP sent to your email' };
-
     return successResponse(
       res,
-      otpResponse,
+      {
+        message: 'OTP sent to your email',
+        expiresIn: `${otpService.getOTPExpiryMinutes()} minutes`
+      },
       'OTP sent successfully. Please check your email.'
     );
   } catch (error) {
@@ -526,4 +514,3 @@ exports.refreshToken = async (req, res, next) => {
     return errorResponse(res, 'Failed to refresh token', 500, error.message);
   }
 };
-

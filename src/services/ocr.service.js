@@ -1,6 +1,13 @@
 const { DocumentAnalysisClient, AzureKeyCredential } = require('@azure/ai-form-recognizer');
 const vision = require('@google-cloud/vision');
-const { parseDate, parseAmount } = require('./parsing.service');
+
+const {
+  extractStatementDateRange,
+  extractTransactionsFromPDFTextDetailed,
+  getHeaderText,
+  parseAmount,
+  parseDate,
+} = require('./parsing.service');
 
 /**
  * OCR Service for extracting transactions from scanned PDFs
@@ -8,21 +15,21 @@ const { parseDate, parseAmount } = require('./parsing.service');
  * Fallback: Google Cloud Vision
  */
 
-// Azure setup (support both legacy and new env variable names)
-const azureEndpoint = process.env.AZURE_DOCUMENT_ENDPOINT || process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT;
-const azureApiKey = process.env.AZURE_DOCUMENT_API_KEY || process.env.AZURE_DOCUMENT_INTELLIGENCE_API_KEY;
+const azureEndpoint =
+  process.env.AZURE_DOCUMENT_ENDPOINT || process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT;
+const azureApiKey =
+  process.env.AZURE_DOCUMENT_API_KEY || process.env.AZURE_DOCUMENT_INTELLIGENCE_API_KEY;
 const azureModelId = process.env.AZURE_DOCUMENT_MODEL_ID || 'prebuilt-layout';
 let azureClient = null;
 
-const isPlaceholderAzureEndpoint = azureEndpoint && (
-  azureEndpoint.includes('your-resource') ||
-  azureEndpoint.includes('example.com')
-);
+const isPlaceholderAzureEndpoint =
+  azureEndpoint &&
+  (azureEndpoint.includes('your-resource') || azureEndpoint.includes('example.com'));
 
 if (azureEndpoint && azureApiKey && !isPlaceholderAzureEndpoint) {
   azureClient = new DocumentAnalysisClient(
     azureEndpoint,
-    new AzureKeyCredential(azureApiKey)
+    new AzureKeyCredential(azureApiKey),
   );
   console.log('✅ Azure OCR configured');
 } else if (isPlaceholderAzureEndpoint) {
@@ -42,7 +49,7 @@ const getAzureConfigStatus = () => ({
       return 'invalid-endpoint-format';
     }
   })(),
-  enabled: !!azureClient
+  enabled: !!azureClient,
 });
 
 const getAzureErrorDetails = (error) => {
@@ -52,24 +59,174 @@ const getAzureErrorDetails = (error) => {
     name: error?.name || null,
     code: error?.code || responseError?.code || null,
     statusCode: error?.statusCode || error?.response?.status || null,
-    details: responseError?.message || null
+    details: responseError?.message || null,
   };
 };
 
-// Google Cloud Vision setup
 let googleClient = null;
 
 if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
   googleClient = new vision.ImageAnnotatorClient();
 }
 
-/**
- * Extract transactions from scanned PDF using OCR
- * @param {Buffer} fileBuffer - PDF file buffer
- * @returns {Promise<Array>} Extracted transactions
- */
-const extractTransactionsFromScannedPDF = async (fileBuffer) => {
-  // Try Azure first
+const normalizeCellText = (value) =>
+  String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const inferDirectionFromToken = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized.includes(' dr') || normalized.endsWith('dr') || normalized.includes(' debit')) {
+    return 'debit';
+  }
+  if (normalized.includes(' cr') || normalized.endsWith('cr') || normalized.includes(' credit')) {
+    return 'credit';
+  }
+  if (/^\s*-/.test(normalized) || normalized.includes('(')) {
+    return 'debit';
+  }
+  if (/^\s*\+/.test(normalized)) {
+    return 'credit';
+  }
+  return null;
+};
+
+const findColumnIndex = (headers, aliases) =>
+  headers.findIndex((header) => aliases.some((alias) => header.includes(alias)));
+
+const buildDescriptionFromRow = (row, indices) => {
+  const candidates = [
+    row[indices.descColIndex],
+    row[indices.refColIndex],
+  ]
+    .map(normalizeCellText)
+    .filter(Boolean);
+
+  if (candidates.length) {
+    return candidates.join(' ').trim();
+  }
+
+  const ignored = new Set(
+    [
+      indices.dateColIndex,
+      indices.debitColIndex,
+      indices.creditColIndex,
+      indices.amountColIndex,
+      indices.balanceColIndex,
+    ].filter((value) => value !== -1),
+  );
+
+  return Object.entries(row)
+    .filter(([columnIndex]) => !ignored.has(Number(columnIndex)))
+    .map(([, value]) => normalizeCellText(value))
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+};
+
+const extractTransactionsFromTable = (table) => {
+  const headers = [];
+  for (const cell of table.cells || []) {
+    if (cell.rowIndex === 0) {
+      headers[cell.columnIndex] = normalizeCellText(cell.content).toLowerCase();
+    }
+  }
+
+  const dateColIndex = findColumnIndex(headers, ['date', 'posting', 'value']);
+  const descColIndex = findColumnIndex(headers, ['description', 'narration', 'details', 'remark']);
+  const debitColIndex = findColumnIndex(headers, ['debit', 'withdrawal', 'outflow']);
+  const creditColIndex = findColumnIndex(headers, ['credit', 'deposit', 'inflow']);
+  const amountColIndex = findColumnIndex(headers, ['amount', 'value']);
+  const balanceColIndex = findColumnIndex(headers, ['balance']);
+  const refColIndex = findColumnIndex(headers, ['reference', 'ref', 'session', 'tranid']);
+
+  if (dateColIndex === -1) {
+    return {
+      headers: headers.filter(Boolean),
+      transactions: [],
+    };
+  }
+
+  const rows = {};
+  for (const cell of table.cells || []) {
+    if (cell.rowIndex === 0) {
+      continue;
+    }
+
+    if (!rows[cell.rowIndex]) {
+      rows[cell.rowIndex] = {};
+    }
+    rows[cell.rowIndex][cell.columnIndex] = normalizeCellText(cell.content);
+  }
+
+  let lastDate = null;
+  const transactions = [];
+
+  for (const rowIndex of Object.keys(rows).sort((left, right) => Number(left) - Number(right))) {
+    const row = rows[rowIndex];
+    const explicitDate = parseDate(row[dateColIndex]);
+    const date = explicitDate || lastDate;
+
+    if (explicitDate) {
+      lastDate = explicitDate;
+    }
+
+    const debit = debitColIndex !== -1 ? parseAmount(row[debitColIndex]) : null;
+    const credit = creditColIndex !== -1 ? parseAmount(row[creditColIndex]) : null;
+    const amountToken = row[amountColIndex] || row[debitColIndex] || row[creditColIndex] || '';
+    const amount =
+      debit || credit || (amountColIndex !== -1 ? parseAmount(row[amountColIndex]) : null);
+    const direction =
+      debit
+        ? 'debit'
+        : credit
+          ? 'credit'
+          : inferDirectionFromToken(amountToken);
+
+    const description = buildDescriptionFromRow(row, {
+      dateColIndex,
+      descColIndex,
+      debitColIndex,
+      creditColIndex,
+      amountColIndex,
+      balanceColIndex,
+      refColIndex,
+    });
+
+    if (!date || !amount || !direction || !description) {
+      continue;
+    }
+
+    transactions.push({
+      date,
+      description,
+      amount: Math.abs(amount),
+      type: direction,
+      direction,
+      reference: normalizeCellText(row[refColIndex]),
+      balance: balanceColIndex !== -1 ? parseAmount(row[balanceColIndex]) : null,
+    });
+  }
+
+  return {
+    headers: headers.filter(Boolean),
+    transactions,
+  };
+};
+
+const parseContentForTransactionsDetailed = (content) => {
+  const parsed = extractTransactionsFromPDFTextDetailed(content || '');
+  return {
+    transactions: parsed.transactions,
+    headerText: parsed.headerText || getHeaderText(content),
+    rawText: parsed.rawText || String(content || ''),
+    tableHeaders: parsed.tableHeaders || [],
+    statementDateRange: parsed.statementDateRange || extractStatementDateRange(content),
+  };
+};
+
+const extractTransactionsFromScannedPDFDetailed = async (fileBuffer) => {
   if (azureClient) {
     console.log('🔵 Using Azure Document Intelligence for OCR');
     try {
@@ -83,7 +240,9 @@ const extractTransactionsFromScannedPDF = async (fileBuffer) => {
         try {
           return await extractWithGoogle(fileBuffer);
         } catch (googleError) {
-          throw new Error(`Both OCR services failed: Azure=${azureErrorDetails.message}; Google=${googleError.message}`);
+          throw new Error(
+            `Both OCR services failed: Azure=${azureErrorDetails.message}; Google=${googleError.message}`,
+          );
         }
       }
 
@@ -91,211 +250,95 @@ const extractTransactionsFromScannedPDF = async (fileBuffer) => {
     }
   }
 
-  // Fallback to Google Cloud Vision when Azure is not enabled
   if (!azureClient) {
     console.warn('⚠️  Azure OCR is not enabled. Config status:', getAzureConfigStatus());
   }
 
   if (googleClient) {
     console.log('🟡 Falling back to Google Cloud Vision for OCR');
-    return await extractWithGoogle(fileBuffer);
+    return extractWithGoogle(fileBuffer);
   }
 
   throw new Error('No OCR service configured (Azure or Google)');
 };
 
-/**
- * Extract transactions using Azure Document Intelligence
- * @param {Buffer} fileBuffer - PDF file buffer
- * @returns {Promise<Array>} Extracted transactions
- */
+const extractTransactionsFromScannedPDF = async (fileBuffer) => {
+  const result = await extractTransactionsFromScannedPDFDetailed(fileBuffer);
+  return result.transactions;
+};
+
 const extractWithAzure = async (fileBuffer) => {
-  const poller = await azureClient.beginAnalyzeDocument(
-    azureModelId,
-    fileBuffer
-  );
-  
-  const { tables, keyValuePairs, content } = await poller.pollUntilDone();
-  
-  const transactions = [];
-  
-  // Strategy 1: Extract from tables
-  if (tables && tables.length > 0) {
+  const poller = await azureClient.beginAnalyzeDocument(azureModelId, fileBuffer);
+  const { tables, content } = await poller.pollUntilDone();
+
+  const tableHeaders = new Set();
+  const tableTransactions = [];
+
+  if (tables?.length) {
     console.log(`📊 Found ${tables.length} table(s) in document`);
-    
     for (const table of tables) {
-      const tableTransactions = extractTransactionsFromTable(table);
-      transactions.push(...tableTransactions);
+      const extracted = extractTransactionsFromTable(table);
+      extracted.headers.forEach((header) => tableHeaders.add(header));
+      tableTransactions.push(...extracted.transactions);
     }
   }
 
-  // Strategy 2: Extract from key-value pairs
-  if (keyValuePairs && keyValuePairs.length > 0 && transactions.length === 0) {
-    console.log(`🔑 Found ${keyValuePairs.length} key-value pairs`);
-    // This would require more sophisticated parsing
-  }
+  const contentParsed = parseContentForTransactionsDetailed(content || '');
+  const selectedTransactions =
+    contentParsed.transactions.length > tableTransactions.length
+      ? contentParsed.transactions
+      : tableTransactions;
 
-  // Strategy 3: Parse raw content as fallback
-  if (content && transactions.length === 0) {
-    console.log('📝 Parsing raw content');
-    const contentTransactions = parseContentForTransactions(content);
-    transactions.push(...contentTransactions);
-  }
+  console.log(`✅ Azure extracted ${selectedTransactions.length} transactions`);
 
-  console.log(`✅ Azure extracted ${transactions.length} transactions`);
-  return transactions;
+  return {
+    provider: 'azure',
+    transactions: selectedTransactions,
+    rawText: String(content || ''),
+    headerText: getHeaderText(content),
+    tableHeaders: Array.from(tableHeaders),
+    statementDateRange: contentParsed.statementDateRange || extractStatementDateRange(content),
+  };
 };
 
-/**
- * Extract transactions from Azure table structure
- * @param {Object} table - Azure table object
- * @returns {Array} Transactions
- */
-const extractTransactionsFromTable = (table) => {
-  const transactions = [];
-  const headers = [];
-  
-  // Extract headers from first row
-  for (const cell of table.cells) {
-    if (cell.rowIndex === 0) {
-      headers[cell.columnIndex] = cell.content.toLowerCase();
-    }
-  }
-  
-  // Find column indices
-  const dateColIndex = headers.findIndex(h => h.includes('date'));
-  const descColIndex = headers.findIndex(h => 
-    h.includes('description') || h.includes('narration') || h.includes('details')
-  );
-  const debitColIndex = headers.findIndex(h => h.includes('debit') || h.includes('withdrawal'));
-  const creditColIndex = headers.findIndex(h => h.includes('credit') || h.includes('deposit'));
-  const amountColIndex = headers.findIndex(h => h.includes('amount'));
-  const refColIndex = headers.findIndex(h => h.includes('reference') || h.includes('ref'));
-  
-  if (dateColIndex === -1) {
-    console.warn('⚠️  No date column found in table');
-    return transactions;
-  }
-  
-  // Group cells by row
-  const rows = {};
-  for (const cell of table.cells) {
-    if (cell.rowIndex === 0) continue; // Skip header row
-    
-    if (!rows[cell.rowIndex]) {
-      rows[cell.rowIndex] = {};
-    }
-    rows[cell.rowIndex][cell.columnIndex] = cell.content;
-  }
-  
-  // Parse each row
-  for (const rowIndex in rows) {
-    const row = rows[rowIndex];
-    
-    const date = parseDate(row[dateColIndex]);
-    const description = row[descColIndex] || '';
-    const debit = debitColIndex !== -1 ? parseAmount(row[debitColIndex]) : null;
-    const credit = creditColIndex !== -1 ? parseAmount(row[creditColIndex]) : null;
-    const amount = debit || credit || (amountColIndex !== -1 ? parseAmount(row[amountColIndex]) : null);
-    const reference = refColIndex !== -1 ? row[refColIndex] : '';
-    
-    if (date && amount) {
-      transactions.push({
-        date,
-        description: description.trim(),
-        amount: Math.abs(amount),
-        type: debit ? 'debit' : 'credit',
-        reference,
-        balance: null
-      });
-    }
-  }
-  
-  return transactions;
-};
-
-/**
- * Parse content text for transactions
- * @param {string} content - Raw text content
- * @returns {Array} Transactions
- */
-const parseContentForTransactions = (content) => {
-  const transactions = [];
-  const lines = content.split('\n');
-  
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    
-    // Try to match transaction pattern
-    // Date ... Description ... Amount
-    const match = line.match(/(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4,}).*?([\d,]+\.?\d*)/);
-    
-    if (match) {
-      const date = parseDate(match[1]);
-      const amount = parseAmount(match[2]);
-      
-      if (date && amount) {
-        const description = line.substring(
-          line.indexOf(match[1]) + match[1].length,
-          line.lastIndexOf(match[2])
-        ).trim();
-        
-        transactions.push({
-          date,
-          description,
-          amount,
-          type: 'unknown',
-          reference: '',
-          balance: null
-        });
-      }
-    }
-  }
-  
-  return transactions;
-};
-
-/**
- * Extract transactions using Google Cloud Vision
- * @param {Buffer} fileBuffer - PDF file buffer
- * @returns {Promise<Array>} Extracted transactions
- */
 const extractWithGoogle = async (fileBuffer) => {
   try {
     const [result] = await googleClient.documentTextDetection({
-      image: { content: fileBuffer.toString('base64') }
+      image: { content: fileBuffer.toString('base64') },
     });
     const fullTextAnnotation = result.fullTextAnnotation;
-    
+
     if (!fullTextAnnotation || !fullTextAnnotation.text) {
       throw new Error('No text detected in document');
     }
-    
+
     const text = fullTextAnnotation.text;
     console.log(`📝 Google extracted ${text.length} characters`);
-    
-    const transactions = parseContentForTransactions(text);
-    
-    console.log(`✅ Google extracted ${transactions.length} transactions`);
-    return transactions;
+
+    const parsed = parseContentForTransactionsDetailed(text);
+
+    console.log(`✅ Google extracted ${parsed.transactions.length} transactions`);
+    return {
+      provider: 'google',
+      transactions: parsed.transactions,
+      rawText: text,
+      headerText: parsed.headerText,
+      tableHeaders: [],
+      statementDateRange: parsed.statementDateRange,
+    };
   } catch (error) {
     throw new Error(`Google OCR failed: ${error.message}`);
   }
 };
 
-/**
- * Validate extracted transactions
- * @param {Array} transactions - Extracted transactions
- * @returns {Object} Validation result
- */
 const validateExtractedTransactions = (transactions) => {
   const valid = [];
   const invalid = [];
-  
+
   for (const transaction of transactions) {
     if (
       transaction.date instanceof Date &&
-      !isNaN(transaction.date.getTime()) &&
+      !Number.isNaN(transaction.date.getTime()) &&
       transaction.amount > 0 &&
       transaction.description
     ) {
@@ -303,47 +346,45 @@ const validateExtractedTransactions = (transactions) => {
     } else {
       invalid.push({
         transaction,
-        reason: !transaction.date ? 'Invalid date' :
-                !transaction.amount ? 'Invalid amount' :
-                !transaction.description ? 'Missing description' : 'Unknown'
+        reason: !transaction.date
+          ? 'Invalid date'
+          : !transaction.amount
+            ? 'Invalid amount'
+            : !transaction.description
+              ? 'Missing description'
+              : 'Unknown',
       });
     }
   }
-  
+
   return {
     valid,
     invalid,
     totalExtracted: transactions.length,
     validCount: valid.length,
     invalidCount: invalid.length,
-    successRate: transactions.length > 0 
-      ? (valid.length / transactions.length * 100).toFixed(2) 
-      : 0
+    successRate: transactions.length > 0 ? ((valid.length / transactions.length) * 100).toFixed(2) : 0,
   };
 };
 
-/**
- * Check if OCR is configured and available
- * @returns {Object} Configuration status
- */
-const checkOCRAvailability = () => {
-  return {
-    azure: {
-      configured: !!(azureEndpoint && azureApiKey),
-      endpoint: azureEndpoint ? '***configured***' : null
-    },
-    google: {
-      configured: !!process.env.GOOGLE_APPLICATION_CREDENTIALS,
-      credentialsPath: process.env.GOOGLE_APPLICATION_CREDENTIALS || null
-    },
-    available: !!(azureClient || googleClient)
-  };
-};
+const checkOCRAvailability = () => ({
+  azure: {
+    configured: !!(azureEndpoint && azureApiKey),
+    endpoint: azureEndpoint ? '***configured***' : null,
+  },
+  google: {
+    configured: !!process.env.GOOGLE_APPLICATION_CREDENTIALS,
+    credentialsPath: process.env.GOOGLE_APPLICATION_CREDENTIALS || null,
+  },
+  available: !!(azureClient || googleClient),
+});
 
 module.exports = {
+  checkOCRAvailability,
+  extractTransactionsFromScannedPDFDetailed,
   extractTransactionsFromScannedPDF,
+  extractTransactionsFromTable,
   extractWithAzure,
   extractWithGoogle,
   validateExtractedTransactions,
-  checkOCRAvailability
 };

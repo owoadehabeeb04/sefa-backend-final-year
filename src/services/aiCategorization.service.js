@@ -2,26 +2,18 @@ const Groq = require('groq-sdk');
 const Category = require('../models/Category');
 
 // Initialize Groq client
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY
-});
+const groq = process.env.GROQ_API_KEY
+  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
+  : null;
 
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const BATCH_SIZE = 20;
 
 /**
  * AI Categorization Service
  * Uses Groq AI to automatically categorize transactions based on description and context
  */
 
-/**
- * Categorize a single transaction using AI
- * @param {Object} transaction - Transaction data
- * @param {String} transaction.description - Transaction description
- * @param {Number} transaction.amount - Transaction amount
- * @param {String} transaction.type - Transaction type ('income' or 'expense')
- * @param {String} userId - User ID for fetching their categories
- * @returns {Promise<Object>} { categoryId, categoryName, confidence }
- */
 async function categorizeTransaction(transaction, userId) {
   try {
     const { description, amount, type = 'expense' } = transaction;
@@ -37,6 +29,10 @@ async function categorizeTransaction(transaction, userId) {
     const categoryNames = userCategories.length > 0
       ? userCategories.map(c => c.name)
       : getDefaultCategoryNames(type);
+
+    if (!groq || process.env.NODE_ENV === 'test') {
+      return getFallbackCategory(description, type, userCategories);
+    }
 
     // Build AI prompt
     const prompt = buildCategorizationPrompt(description, amount, type, categoryNames);
@@ -100,79 +96,117 @@ async function batchCategorizeTransactions(transactions, userId) {
     isActive: true
   }).select('name');
 
-  // Process in batches of 10 to avoid rate limits
-  const batchSize = 10;
+  // Process in larger true-AI batches to reduce per-transaction latency
+  const batchSize = BATCH_SIZE;
   const results = [];
 
   for (let i = 0; i < transactions.length; i += batchSize) {
     const batch = transactions.slice(i, i + batchSize);
-    
-    const batchPromises = batch.map(async (transaction) => {
+    const fallbackResults = batch.map((transaction) => {
       const categories = transaction.type === 'expense' ? expenseCategories : incomeCategories;
-      
-      try {
-        const categoryNames = categories.length > 0
-          ? categories.map(c => c.name)
-          : getDefaultCategoryNames(transaction.type);
+      const fallback = getFallbackCategory(transaction.description, transaction.type, categories);
 
-        const prompt = buildCategorizationPrompt(
-          transaction.description,
-          transaction.amount,
-          transaction.type,
-          categoryNames
-        );
-
-        const completion = await groq.chat.completions.create({
-          messages: [
-            {
-              role: 'system',
-              content: 'You are a financial transaction categorization expert. Analyze the transaction and return ONLY the category name from the provided list.'
-            },
-            {
-              role: 'user',
-              content: prompt
-            }
-          ],
-          model: GROQ_MODEL,
-          temperature: 0.3,
-          max_tokens: 30
-        });
-
-        const response = completion.choices[0]?.message?.content?.trim();
-        const category = parseCategorizationResponse(response, categories, transaction.type);
-
-        return {
-          transactionId: transaction._id || transaction.id,
-          categoryId: category.categoryId,
-          categoryName: category.categoryName,
-          confidence: category.confidence,
-          description: transaction.description
-        };
-
-      } catch (error) {
-        console.error('Batch categorization error for transaction:', transaction.description, error);
-        const fallback = getFallbackCategory(transaction.description, transaction.type, categories);
-        
-        return {
-          transactionId: transaction._id || transaction.id,
-          categoryId: fallback.categoryId,
-          categoryName: fallback.categoryName,
-          confidence: fallback.confidence,
-          description: transaction.description
-        };
-      }
+      return {
+        transactionId: transaction._id || transaction.id,
+        categoryId: fallback.categoryId,
+        categoryName: fallback.categoryName,
+        confidence: fallback.confidence,
+        description: transaction.description
+      };
     });
 
-    const batchResults = await Promise.all(batchPromises);
-    results.push(...batchResults);
+    if (!groq || process.env.NODE_ENV === 'test') {
+      results.push(...fallbackResults);
+      continue;
+    }
 
-    // Small delay between batches to avoid rate limits
-    if (i + batchSize < transactions.length) {
-      await new Promise(resolve => setTimeout(resolve, 500));
+    try {
+      const serializedBatch = batch.map((transaction) => {
+        const categories = transaction.type === 'expense' ? expenseCategories : incomeCategories;
+        return {
+          id: String(transaction._id || transaction.id),
+          description: transaction.description,
+          amount: transaction.amount,
+          type: transaction.type,
+          availableCategories:
+            categories.length > 0 ? categories.map((category) => category.name) : getDefaultCategoryNames(transaction.type),
+        };
+      });
+
+      const completion = await groq.chat.completions.create({
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a financial transaction categorization expert. Return ONLY valid JSON in the shape {"results":[{"id":"...", "category":"...", "confidence":"high|medium|low"}]}. Use only categories provided for each transaction. If unsure, pick the best available category and mark confidence as low.'
+          },
+          {
+            role: 'user',
+            content: JSON.stringify({
+              task: 'batch_categorize_transactions',
+              transactions: serializedBatch,
+            })
+          }
+        ],
+        model: GROQ_MODEL,
+        temperature: 0.2,
+        max_tokens: Math.max(300, batch.length * 40)
+      });
+
+      const rawResponse = completion.choices[0]?.message?.content?.trim();
+      const parsedResponse = parseBatchCategorizationResponse(rawResponse);
+      const byId = new Map(parsedResponse.map((entry) => [String(entry.id), entry]));
+
+      const batchResults = batch.map((transaction, index) => {
+        const transactionId = String(transaction._id || transaction.id);
+        const categories = transaction.type === 'expense' ? expenseCategories : incomeCategories;
+        const parsed = byId.get(transactionId);
+
+        if (!parsed?.category) {
+          return fallbackResults[index];
+        }
+
+        const category = parseCategorizationResponse(parsed.category, categories, transaction.type);
+
+        return {
+          transactionId,
+          categoryId: category.categoryId,
+          categoryName: category.categoryName,
+          confidence: parsed.confidence || category.confidence,
+          description: transaction.description
+        };
+      });
+
+      results.push(...batchResults);
+    } catch (error) {
+      console.error('Batch categorization error:', error);
+      results.push(...fallbackResults);
     }
   }
 
   return results;
+}
+
+function parseBatchCategorizationResponse(response) {
+  if (!response) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(response);
+    return Array.isArray(parsed?.results) ? parsed.results : [];
+  } catch {
+    const match = String(response).match(/\{[\s\S]*\}/);
+    if (!match) {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(match[0]);
+      return Array.isArray(parsed?.results) ? parsed.results : [];
+    } catch {
+      return [];
+    }
+  }
 }
 
 /**

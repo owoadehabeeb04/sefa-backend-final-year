@@ -103,8 +103,8 @@ userSchema.methods.comparePassword = async function(candidatePassword) {
 };
 
 // Method to generate OTP using OTP service
-userSchema.methods.generateOTP = function(useDefault = false) {
-  const otpData = otpService.generateOTP({ useDefault });
+userSchema.methods.generateOTP = function() {
+  const otpData = otpService.generateOTP();
   this.otp = {
     code: otpData.code,
     expiresAt: otpData.expiresAt
@@ -153,4 +153,3 @@ userSchema.statics.cleanupUnverifiedUsers = async function() {
 };
 
 module.exports = mongoose.model('User', userSchema);
-

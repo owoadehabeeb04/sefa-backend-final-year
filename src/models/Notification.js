@@ -125,7 +125,6 @@ notificationSchema.index({ userId: 1, createdAt: -1 });
 notificationSchema.index({ userId: 1, isRead: 1, createdAt: -1 });
 notificationSchema.index({ userId: 1, type: 1, createdAt: -1 });
 notificationSchema.index({ urgency: 1, isSent: 1, scheduledFor: 1 }); // For sending job
-notificationSchema.index({ expiresAt: 1 }); // For cleanup job
 
 // Pre-save hook to set expiry date
 notificationSchema.pre('save', function(next) {

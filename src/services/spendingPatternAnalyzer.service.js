@@ -1,6 +1,7 @@
 const Expense = require('../models/Expense');
 const Income = require('../models/Income');
 const Category = require('../models/Category');
+const mongoose = require('mongoose');
 const moment = require('moment');
 
 /**
@@ -63,6 +64,13 @@ async function analyzeSpendingPatterns(userId, options = {}) {
   };
 }
 
+function normalizeUserId(userId) {
+  if (mongoose.Types.ObjectId.isValid(userId)) {
+    return new mongoose.Types.ObjectId(String(userId));
+  }
+  return userId;
+}
+
 /**
  * Analyze category spending trends
  * @param {String} userId - User ID
@@ -71,10 +79,11 @@ async function analyzeSpendingPatterns(userId, options = {}) {
  * @returns {Promise<Array>} Category trends
  */
 async function analyzeCategoryTrends(userId, startDate, endDate) {
+  const normalizedUserId = normalizeUserId(userId);
   const categorySpending = await Expense.aggregate([
     {
       $match: {
-        userId: userId,
+        userId: normalizedUserId,
         date: { $gte: startDate, $lte: endDate }
       }
     },
@@ -267,10 +276,11 @@ async function analyzeSpendingVelocity(userId, startDate, endDate) {
  * @returns {Promise<Object>} Category concentration analysis
  */
 async function analyzeCategoryConcentration(userId, startDate, endDate) {
+  const normalizedUserId = normalizeUserId(userId);
   const categoryTotals = await Expense.aggregate([
     {
       $match: {
-        userId: userId,
+        userId: normalizedUserId,
         date: { $gte: startDate, $lte: endDate }
       }
     },
@@ -346,6 +356,7 @@ async function analyzeCategoryConcentration(userId, startDate, endDate) {
  * @returns {Promise<Object>} Monthly comparison
  */
 async function analyzeMonthlyComparison(userId, months) {
+  const normalizedUserId = normalizeUserId(userId);
   const comparisons = [];
 
   for (let i = 0; i < months; i++) {
@@ -356,7 +367,7 @@ async function analyzeMonthlyComparison(userId, months) {
       Expense.aggregate([
         {
           $match: {
-            userId: userId,
+            userId: normalizedUserId,
             date: { $gte: monthStart, $lte: monthEnd }
           }
         },
@@ -371,7 +382,7 @@ async function analyzeMonthlyComparison(userId, months) {
       Income.aggregate([
         {
           $match: {
-            userId: userId,
+            userId: normalizedUserId,
             date: { $gte: monthStart, $lte: monthEnd }
           }
         },

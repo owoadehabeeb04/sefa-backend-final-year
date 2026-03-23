@@ -67,6 +67,12 @@ const bankConnectionSchema = new mongoose.Schema({
   lastSyncAt: {
     type: Date
   },
+  lastSuccessfulSyncAt: {
+    type: Date
+  },
+  lastSyncAttemptAt: {
+    type: Date
+  },
   nextSyncAt: {
     type: Date
   },
@@ -80,11 +86,39 @@ const bankConnectionSchema = new mongoose.Schema({
   },
   syncStatus: {
     type: String,
-    enum: ['active', 'syncing', 'paused', 'error', 'disconnected', 'reauth_required'],
+    enum: [
+      'active',
+      'queued',
+      'syncing',
+      'completed',
+      'partial_success',
+      'failed',
+      'cancelled',
+      'paused',
+      'error',
+      'disconnected',
+      'reauth_required',
+    ],
     default: 'active'
   },
   lastSyncError: {
     type: String
+  },
+  lastSyncErrorSummary: {
+    type: String
+  },
+  currentSyncLogId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'SyncLog',
+    default: null
+  },
+  cancelRequested: {
+    type: Boolean,
+    default: false
+  },
+  pendingResync: {
+    type: Boolean,
+    default: false
   },
 
   // Metadata
@@ -112,6 +146,7 @@ const bankConnectionSchema = new mongoose.Schema({
 bankConnectionSchema.index({ userId: 1, isActive: 1 });
 bankConnectionSchema.index({ userId: 1, isPrimary: 1 });
 bankConnectionSchema.index({ nextSyncAt: 1, autoSync: 1, syncStatus: 1 }); // For sync job
+bankConnectionSchema.index({ userId: 1, currentSyncLogId: 1 });
 
 // Encrypt tokens before saving
 bankConnectionSchema.pre('save', function(next) {
@@ -169,7 +204,10 @@ bankConnectionSchema.statics.getConnectionsForSync = async function() {
   return this.find({
     isActive: true,
     autoSync: true,
-    syncStatus: { $in: ['active', 'error'] },
+    cancelRequested: false,
+    syncStatus: {
+      $in: ['active', 'completed', 'partial_success', 'failed', 'cancelled', 'error']
+    },
     $or: [
       { nextSyncAt: { $lte: now } },
       { nextSyncAt: null }
