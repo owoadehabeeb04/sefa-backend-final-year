@@ -1,11 +1,11 @@
 const express = require('express');
 const router = express.Router();
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireVerifiedEmail, requireOnboardingComplete } = require('../middleware/auth');
 const { validateExpense } = require('../middleware/validators');
 const expenseController = require('../controllers/expenseController');
 
 // All routes require authentication
-router.use(authenticate);
+router.use(authenticate, requireVerifiedEmail, requireOnboardingComplete);
 
 /**
  * @route   POST /api/v1/expenses

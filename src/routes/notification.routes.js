@@ -1,11 +1,11 @@
 const express = require('express');
 const router = express.Router();
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireVerifiedEmail, requireOnboardingComplete } = require('../middleware/auth');
 const notificationController = require('../controllers/notification.controller');
 const notificationPreferencesController = require('../controllers/notificationPreferences.controller');
 
 // All routes require authentication
-router.use(authenticate);
+router.use(authenticate, requireVerifiedEmail, requireOnboardingComplete);
 
 // ─── Notification CRUD ────────────────────────────────────────────────────────
 

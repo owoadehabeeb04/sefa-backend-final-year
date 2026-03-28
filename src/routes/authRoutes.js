@@ -1,16 +1,25 @@
 const express = require('express');
 const router = express.Router();
 const authController = require('../controllers/authController');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireVerifiedEmail } = require('../middleware/auth');
+const {
+  authLimiter,
+  otpRequestLimiter,
+  otpVerifyLimiter,
+  refreshTokenLimiter,
+} = require('../middleware/rateLimit.middleware');
 const {
   validateRegister,
   validateLogin,
   validateUpdateProfile,
   validateForgotPassword,
   validateResetPassword,
+  validateLogout,
   validateRefreshToken,
   validateVerifyEmail,
-  validateResendOTP
+  validateVerifyPasswordResetOTP,
+  validateResendOTP,
+  validateResendPasswordResetOTP,
 } = require('../middleware/validators');
 
 /**
@@ -113,7 +122,7 @@ const {
  *       422:
  *         description: Validation error
  */
-router.post('/register', validateRegister, authController.register);
+router.post('/register', authLimiter, validateRegister, authController.register);
 
 /**
  * @swagger
@@ -167,7 +176,7 @@ router.post('/register', validateRegister, authController.register);
  *       422:
  *         description: Validation error
  */
-router.post('/login', validateLogin, authController.login);
+router.post('/login', authLimiter, validateLogin, authController.login);
 
 /**
  * @swagger
@@ -238,7 +247,7 @@ router.get('/me', authenticate, authController.getCurrentUser);
  *       422:
  *         description: Validation error
  */
-router.put('/profile', authenticate, validateUpdateProfile, authController.updateProfile);
+router.put('/profile', authenticate, requireVerifiedEmail, validateUpdateProfile, authController.updateProfile);
 
 /**
  * @swagger
@@ -278,7 +287,14 @@ router.put('/profile', authenticate, validateUpdateProfile, authController.updat
  *       422:
  *         description: Validation error
  */
-router.post('/forgot-password', validateForgotPassword, authController.forgotPassword);
+router.post('/forgot-password', otpRequestLimiter, validateForgotPassword, authController.forgotPassword);
+
+router.post(
+  '/verify-password-reset-otp',
+  otpVerifyLimiter,
+  validateVerifyPasswordResetOTP,
+  authController.verifyPasswordResetOTP
+);
 
 /**
  * @swagger
@@ -314,7 +330,7 @@ router.post('/forgot-password', validateForgotPassword, authController.forgotPas
  *       422:
  *         description: Validation error
  */
-router.post('/reset-password', validateResetPassword, authController.resetPassword);
+router.post('/reset-password', otpVerifyLimiter, validateResetPassword, authController.resetPassword);
 
 /**
  * @swagger
@@ -330,7 +346,7 @@ router.post('/reset-password', validateResetPassword, authController.resetPasswo
  *       401:
  *         description: Unauthorized
  */
-router.post('/logout', authenticate, authController.logout);
+router.post('/logout', authenticate, validateLogout, authController.logout);
 
 /**
  * @swagger
@@ -384,7 +400,7 @@ router.post('/logout', authenticate, authController.logout);
  *       422:
  *         description: Validation error
  */
-router.post('/verify-email', validateVerifyEmail, authController.verifyEmail);
+router.post('/verify-email', otpVerifyLimiter, validateVerifyEmail, authController.verifyEmail);
 
 /**
  * @swagger
@@ -428,7 +444,14 @@ router.post('/verify-email', validateVerifyEmail, authController.verifyEmail);
  *       422:
  *         description: Validation error
  */
-router.post('/resend-otp', validateResendOTP, authController.resendOTP);
+router.post('/resend-otp', otpRequestLimiter, validateResendOTP, authController.resendOTP);
+
+router.post(
+  '/resend-password-reset-otp',
+  otpRequestLimiter,
+  validateResendPasswordResetOTP,
+  authController.resendPasswordResetOTP
+);
 
 /**
  * @swagger
@@ -467,6 +490,6 @@ router.post('/resend-otp', validateResendOTP, authController.resendOTP);
  *       401:
  *         description: Invalid or expired refresh token
  */
-router.post('/refresh-token', validateRefreshToken, authController.refreshToken);
+router.post('/refresh-token', refreshTokenLimiter, validateRefreshToken, authController.refreshToken);
 
 module.exports = router;

@@ -1,10 +1,10 @@
 const express = require('express');
 const router = express.Router();
-const { authenticate } = require('../middleware/auth');
+const { authenticate, requireVerifiedEmail, requireOnboardingComplete } = require('../middleware/auth');
 const transactionController = require('../controllers/transactionController');
 
 // All routes require authentication
-router.use(authenticate);
+router.use(authenticate, requireVerifiedEmail, requireOnboardingComplete);
 
 /**
  * @route   GET /api/v1/transactions

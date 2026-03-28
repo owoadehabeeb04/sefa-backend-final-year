@@ -136,6 +136,12 @@ exports.recordConsent = async (req, res, next) => {
       return errorResponse(res, 'dataAnalysis must be a boolean', 400);
     }
 
+    if (!dataAnalysis) {
+      return errorResponse(res, 'Data analysis consent is required to continue', 400, {
+        code: 'CONSENT_REQUIRED',
+      });
+    }
+
     const user = await User.findById(userId);
     if (!user) {
       return errorResponse(res, 'User not found', 404);
@@ -191,11 +197,6 @@ exports.completeOnboarding = async (req, res, next) => {
     const user = await User.findById(userId);
     if (!user) {
       return errorResponse(res, 'User not found', 404);
-    }
-
-    // Verify all required steps are completed
-    if (!user.financialProfile || !user.financialProfile.incomeType) {
-      return errorResponse(res, 'Please complete financial profile setup', 400);
     }
 
     if (!user.consent || !user.consent.dataAnalysis) {
@@ -258,8 +259,9 @@ exports.getOnboardingStatus = async (req, res, next) => {
       {
         onboardingCompleted: user.onboardingCompleted,
         onboardingStatus: user.onboardingStatus,
+        isVerified: user.isVerified,
         steps: {
-          profileCompleted: !!user.financialProfile?.incomeType,
+          budgetSet: user.monthlyBudgetLimit != null && user.monthlyBudgetLimit > 0,
           consentGiven: !!user.consent?.dataAnalysis,
           categoriesInitialized: categoriesCount > 0
         },
@@ -311,4 +313,3 @@ async function initializeDefaultCategories(userId) {
     throw error;
   }
 }
-

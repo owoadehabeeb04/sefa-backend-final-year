@@ -1,20 +1,83 @@
-const User = require('../models/User');
 const jwt = require('jsonwebtoken');
-const { validationResult } = require('express-validator');
-const { successResponse, errorResponse } = require('../utils/response');
+const User = require('../models/User');
 const otpService = require('../services/otpService');
+const { successResponse, errorResponse } = require('../utils/response');
 
-// Generate JWT Token
-const generateToken = (userId) => {
-  return jwt.sign({ userId }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRES_IN || '15m'
-  });
+const buildUserPayload = (user) => ({
+  id: user._id,
+  name: user.name,
+  email: user.email,
+  currency: user.currency,
+  preferences: user.preferences,
+  isVerified: user.isVerified,
+  onboardingCompleted: user.onboardingCompleted,
+  onboardingStatus: user.onboardingStatus,
+  createdAt: user.createdAt,
+  updatedAt: user.updatedAt,
+});
+
+const generateToken = (user) => jwt.sign(
+  { userId: user._id.toString(), tokenVersion: user.tokenVersion || 0 },
+  process.env.JWT_SECRET,
+  { expiresIn: process.env.JWT_EXPIRES_IN || '15m' }
+);
+
+const generateRefreshToken = (user) => jwt.sign(
+  { userId: user._id.toString(), tokenVersion: user.tokenVersion || 0 },
+  process.env.JWT_REFRESH_SECRET,
+  { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d' }
+);
+
+const issueAuthTokens = (user) => ({
+  token: generateToken(user),
+  refreshToken: generateRefreshToken(user),
+});
+
+const findUserByEmail = (email, includePassword = false) => {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  const query = User.findOne({ email: normalizedEmail });
+
+  return includePassword ? query.select('+password') : query;
 };
 
-// Generate Refresh Token
-const generateRefreshToken = (userId) => {
-  return jwt.sign({ userId }, process.env.JWT_REFRESH_SECRET, {
-    expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d'
+const sendEmailNotFoundResponse = (res) => errorResponse(
+  res,
+  'We could not find an account for this email address.',
+  404,
+  { code: 'EMAIL_NOT_FOUND' }
+);
+
+const sendEmailVerificationStatusResponse = (res, message, statusCode = 403, code = 'EMAIL_NOT_VERIFIED') =>
+  errorResponse(res, message, statusCode, { code });
+
+const sendOtpVerification = async (user, purpose) => {
+  const otp = user.generateOTP(purpose);
+  await user.save();
+  await otpService.sendOTPEmail(user.email, otp, purpose);
+};
+
+const persistOtpFailure = async (user, verificationResult) => {
+  if (typeof verificationResult.attempts === 'number') {
+    await user.save();
+  }
+};
+
+const verifyUserOtp = async (user, otp, purpose) => {
+  const verification = user.verifyOTP(otp, purpose);
+
+  if (!verification.valid) {
+    await persistOtpFailure(user, verification);
+  }
+
+  return verification;
+};
+
+const respondWithOtpError = (res, verification) => {
+  const statusCode = verification.code === 'OTP_LOCKED' ? 429 : 400;
+  return errorResponse(res, verification.message, statusCode, {
+    code: verification.code,
+    retryAfterSeconds: verification.retryAfterSeconds,
+    remainingAttempts: verification.remainingAttempts,
   });
 };
 
@@ -23,25 +86,19 @@ const generateRefreshToken = (userId) => {
  * @desc    Register a new user (sends OTP for email verification)
  * @access  Public
  */
-exports.register = async (req, res, next) => {
+exports.register = async (req, res) => {
   try {
-    // Validation is now handled by middleware, so we can proceed directly
     const { name, email, password, currency } = req.body;
 
-    // Check if user already exists
-    const existingUser = await User.findOne({ email });
+    const existingUser = await findUserByEmail(email);
     if (existingUser) {
-      // If user exists but is NOT verified, delete the old unverified account and allow re-registration
       if (!existingUser.isVerified) {
-        console.log(`Deleting unverified user account for ${email} to allow re-registration`);
         await User.findByIdAndDelete(existingUser._id);
       } else {
-        // User is verified - cannot re-register
         return errorResponse(res, 'User with this email already exists', 409);
       }
     }
 
-    // Create new user (NOT verified yet)
     const user = await User.create({
       name,
       email,
@@ -49,30 +106,23 @@ exports.register = async (req, res, next) => {
       currency: currency || 'NGN',
       isVerified: false,
       onboardingCompleted: false,
-      onboardingStatus: 'started'
+      onboardingStatus: 'started',
     });
 
-    // Generate OTP for email verification
-    const otp = user.generateOTP();
-    await user.save();
-
-    // Send OTP via email
-    await otpService.sendOTPEmail(user.email, otp, 'email-verification');
-
-    // Don't generate tokens yet - wait for verification
-    // Return user data (without password or tokens)
-    const userData = {
-      id: user._id,
-      email: user.email,
-      isVerified: user.isVerified
-    };
+    await sendOtpVerification(user, otpService.OTP_PURPOSES.EMAIL_VERIFICATION);
 
     return successResponse(
       res,
       {
-        user: userData,
+        user: {
+          id: user._id,
+          email: user.email,
+          isVerified: user.isVerified,
+          onboardingCompleted: user.onboardingCompleted,
+          onboardingStatus: user.onboardingStatus,
+        },
         requiresVerification: true,
-        expiresIn: `${otpService.getOTPExpiryMinutes()} minutes`
+        expiresIn: `${otpService.getOTPExpiryMinutes()} minutes`,
       },
       'Registration successful. Please verify your email with the OTP sent.',
       201
@@ -88,75 +138,49 @@ exports.register = async (req, res, next) => {
  * @desc    Login user (checks verification status)
  * @access  Public
  */
-exports.login = async (req, res, next) => {
+exports.login = async (req, res) => {
   try {
-    // Validation is now handled by middleware
     const { email, password } = req.body;
+    const user = await findUserByEmail(email, true);
 
-    // Find user and include password for comparison
-    const user = await User.findOne({ email }).select('+password');
     if (!user) {
       return errorResponse(res, 'Invalid email or password', 401);
     }
 
-    // Check password
     const isPasswordValid = await user.comparePassword(password);
     if (!isPasswordValid) {
       return errorResponse(res, 'Invalid email or password', 401);
     }
 
-    // Check if user is verified
     if (!user.isVerified) {
-      // Generate tokens anyway (for OTP verification flow)
-      const token = generateToken(user._id);
-      const refreshToken = generateRefreshToken(user._id);
-
-      // Return user data with verification status
-      const userData = {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        currency: user.currency,
-        isVerified: false,
-        onboardingCompleted: user.onboardingCompleted,
-        preferences: user.preferences
-      };
-
       return successResponse(
         res,
         {
-          user: userData,
-          token,
-          refreshToken,
-          requiresVerification: true
+          user: {
+            id: user._id,
+            name: user.name,
+            email: user.email,
+            currency: user.currency,
+            isVerified: false,
+            onboardingCompleted: user.onboardingCompleted,
+            onboardingStatus: user.onboardingStatus,
+            preferences: user.preferences,
+          },
+          requiresVerification: true,
         },
-        'Login successful. Please verify your email to continue.',
-        200
+        'Login successful. Please verify your email to continue.'
       );
     }
 
-    // User is verified - proceed with normal login
-    const token = generateToken(user._id);
-    const refreshToken = generateRefreshToken(user._id);
-
-    // Return user data (without password)
-    const userData = {
-      id: user._id,
-      name: user.name,
-      email: user.email,
-      currency: user.currency,
-      isVerified: user.isVerified,
-      onboardingCompleted: user.onboardingCompleted,
-      preferences: user.preferences
-    };
+    const { token, refreshToken } = issueAuthTokens(user);
 
     return successResponse(
       res,
       {
-        user: userData,
+        user: buildUserPayload(user),
         token,
         refreshToken,
-        requiresVerification: false
+        requiresVerification: false,
       },
       'Login successful'
     );
@@ -171,26 +195,14 @@ exports.login = async (req, res, next) => {
  * @desc    Get current user
  * @access  Private
  */
-exports.getCurrentUser = async (req, res, next) => {
+exports.getCurrentUser = async (req, res) => {
   try {
     const user = await User.findById(req.user.userId);
     if (!user) {
       return errorResponse(res, 'User not found', 404);
     }
 
-    const userData = {
-      id: user._id,
-      name: user.name,
-      email: user.email,
-      currency: user.currency,
-      preferences: user.preferences,
-      isVerified: user.isVerified,
-      onboardingCompleted: user.onboardingCompleted,
-      createdAt: user.createdAt,
-      updatedAt: user.updatedAt
-    };
-
-    return successResponse(res, { user: userData }, 'User retrieved successfully');
+    return successResponse(res, { user: buildUserPayload(user) }, 'User retrieved successfully');
   } catch (error) {
     console.error('Get current user error:', error);
     return errorResponse(res, 'Failed to retrieve user', 500, error.message);
@@ -202,47 +214,29 @@ exports.getCurrentUser = async (req, res, next) => {
  * @desc    Update user profile
  * @access  Private
  */
-exports.updateProfile = async (req, res, next) => {
+exports.updateProfile = async (req, res) => {
   try {
-    // Validation is now handled by middleware
     const { name, currency, preferences } = req.body;
-    const userId = req.user.userId;
-
-    // Build update object
-    const updateData = {};
-    if (name) updateData.name = name;
-    if (currency) updateData.currency = currency.toUpperCase();
-    if (preferences) {
-      updateData.preferences = {
-        ...updateData.preferences,
-        ...preferences
-      };
-    }
-
-    // Update user
-    const user = await User.findByIdAndUpdate(
-      userId,
-      updateData,
-      { new: true, runValidators: true }
-    );
+    const user = await User.findById(req.user.userId);
 
     if (!user) {
       return errorResponse(res, 'User not found', 404);
     }
 
-    const userData = {
-      id: user._id,
-      name: user.name,
-      email: user.email,
-      currency: user.currency,
-      preferences: user.preferences,
-      isVerified: user.isVerified,
-      onboardingCompleted: user.onboardingCompleted
-    };
+    if (name) user.name = name;
+    if (currency) user.currency = currency.toUpperCase();
+    if (preferences) {
+      user.preferences = {
+        ...user.preferences,
+        ...preferences,
+      };
+    }
+
+    await user.save();
 
     return successResponse(
       res,
-      { user: userData },
+      { user: buildUserPayload(user) },
       'Profile updated successfully'
     );
   } catch (error) {
@@ -256,43 +250,37 @@ exports.updateProfile = async (req, res, next) => {
  * @desc    Request OTP for password reset
  * @access  Public
  */
-exports.forgotPassword = async (req, res, next) => {
+exports.forgotPassword = async (req, res) => {
   try {
-    // Validation is now handled by middleware
     const { email } = req.body;
+    const user = await findUserByEmail(email);
 
-    // Find user
-    const user = await User.findOne({ email });
     if (!user) {
-      // Return error if user doesn't exist (better UX)
-      return errorResponse(
-        res,
-        'No account found with this email address. Please check your email or sign up.',
-        404
-      );
+      return sendEmailNotFoundResponse(res);
     }
 
-    // Check if user is verified
     if (!user.isVerified) {
-      return errorResponse(
+      return sendEmailVerificationStatusResponse(
         res,
-        'Please verify your email first. Check your inbox for the verification code.',
-        403
+        'Please verify your email before resetting your password.'
       );
     }
 
-    // Generate OTP using OTP service
-    const otp = user.generateOTP();
-    await user.save();
+    const resendStatus = user.canResendOTP(otpService.OTP_PURPOSES.PASSWORD_RESET);
+    if (!resendStatus.allowed) {
+      return errorResponse(res, 'Please wait before requesting another code', 429, {
+        code: 'OTP_RESEND_TOO_SOON',
+        retryAfterSeconds: resendStatus.secondsRemaining,
+      });
+    }
 
-    // Send OTP via email using OTP service
-    await otpService.sendOTPEmail(user.email, otp, 'password-reset');
-
+    await sendOtpVerification(user, otpService.OTP_PURPOSES.PASSWORD_RESET);
     return successResponse(
       res,
       {
         message: 'OTP sent to your email',
-        expiresIn: `${otpService.getOTPExpiryMinutes()} minutes`
+        expiresIn: `${otpService.getOTPExpiryMinutes()} minutes`,
+        resendAvailableInSeconds: otpService.OTP_RESEND_COOLDOWN_SECONDS,
       },
       'OTP sent successfully. Please check your email.'
     );
@@ -303,30 +291,71 @@ exports.forgotPassword = async (req, res, next) => {
 };
 
 /**
+ * @route   POST /api/v1/auth/verify-password-reset-otp
+ * @desc    Verify password reset OTP before accepting a new password
+ * @access  Public
+ */
+exports.verifyPasswordResetOTP = async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    const user = await findUserByEmail(email);
+
+    if (!user) {
+      return sendEmailNotFoundResponse(res);
+    }
+
+    if (!user.isVerified) {
+      return sendEmailVerificationStatusResponse(
+        res,
+        'Please verify your email before using password reset.'
+      );
+    }
+
+    const verification = await verifyUserOtp(user, otp, otpService.OTP_PURPOSES.PASSWORD_RESET);
+    if (!verification.valid) {
+      return respondWithOtpError(res, verification);
+    }
+
+    return successResponse(
+      res,
+      { canResetPassword: true },
+      'OTP verified successfully'
+    );
+  } catch (error) {
+    console.error('Verify password reset OTP error:', error);
+    return errorResponse(res, 'Failed to verify OTP', 500, error.message);
+  }
+};
+
+/**
  * @route   POST /api/v1/auth/reset-password
  * @desc    Reset password with OTP
  * @access  Public
  */
-exports.resetPassword = async (req, res, next) => {
+exports.resetPassword = async (req, res) => {
   try {
-    // Validation is now handled by middleware
     const { email, otp, newPassword } = req.body;
+    const user = await findUserByEmail(email, true);
 
-    // Find user
-    const user = await User.findOne({ email });
     if (!user) {
-      return errorResponse(res, 'Invalid email or OTP', 400);
+      return sendEmailNotFoundResponse(res);
     }
 
-    // Verify OTP using OTP service
-    const otpVerification = user.verifyOTP(otp);
-    if (!otpVerification.valid) {
-      return errorResponse(res, otpVerification.message, 400);
+    if (!user.isVerified) {
+      return sendEmailVerificationStatusResponse(
+        res,
+        'Please verify your email before resetting your password.'
+      );
     }
 
-    // Update password
+    const verification = await verifyUserOtp(user, otp, otpService.OTP_PURPOSES.PASSWORD_RESET);
+    if (!verification.valid) {
+      return respondWithOtpError(res, verification);
+    }
+
     user.password = newPassword;
-    user.clearOTP();
+    user.clearOTP(otpService.OTP_PURPOSES.PASSWORD_RESET);
+    user.bumpTokenVersion();
     await user.save();
 
     return successResponse(
@@ -342,19 +371,39 @@ exports.resetPassword = async (req, res, next) => {
 
 /**
  * @route   POST /api/v1/auth/logout
- * @desc    Logout user (token invalidation handled on client)
+ * @desc    Logout user from all sessions
  * @access  Private
  */
-exports.logout = async (req, res, next) => {
+exports.logout = async (req, res) => {
   try {
-    // Token invalidation is typically handled on the client side
-    // In a more advanced setup, you could maintain a token blacklist
+    const { refreshToken } = req.body;
+    const user = await User.findById(req.user.userId);
+
+    if (!user) {
+      return errorResponse(res, 'User not found', 404);
+    }
+
+    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+    if (
+      decoded.userId !== user._id.toString()
+      || (decoded.tokenVersion || 0) !== (user.tokenVersion || 0)
+    ) {
+      return errorResponse(res, 'Invalid refresh token', 401);
+    }
+
+    user.bumpTokenVersion();
+    await user.save();
+
     return successResponse(
       res,
       { message: 'Logged out successfully' },
       'Logout successful'
     );
   } catch (error) {
+    if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+      return errorResponse(res, 'Invalid refresh token', 401);
+    }
+
     console.error('Logout error:', error);
     return errorResponse(res, 'Logout failed', 500, error.message);
   }
@@ -365,57 +414,40 @@ exports.logout = async (req, res, next) => {
  * @desc    Verify email with OTP
  * @access  Public
  */
-exports.verifyEmail = async (req, res, next) => {
+exports.verifyEmail = async (req, res) => {
   try {
-    // Validation is handled by middleware
     const { email, otp } = req.body;
+    const user = await findUserByEmail(email);
 
-    // Find user
-    const user = await User.findOne({ email });
     if (!user) {
-      return errorResponse(res, 'User not found', 404);
+      return sendEmailNotFoundResponse(res);
     }
 
-    // Check if already verified
     if (user.isVerified) {
       return successResponse(
         res,
-        { user: { id: user._id, isVerified: true } },
+        { user: buildUserPayload(user) },
         'Email is already verified'
       );
     }
 
-    // Verify OTP
-    const otpVerification = user.verifyOTP(otp);
-    if (!otpVerification.valid) {
-      return errorResponse(res, otpVerification.message, 400);
+    const verification = await verifyUserOtp(user, otp, otpService.OTP_PURPOSES.EMAIL_VERIFICATION);
+    if (!verification.valid) {
+      return respondWithOtpError(res, verification);
     }
 
-    // Mark user as verified
     user.isVerified = true;
-    user.clearOTP();
+    user.clearOTP(otpService.OTP_PURPOSES.EMAIL_VERIFICATION);
     await user.save();
 
-    // Generate new tokens (user is now verified)
-    const token = generateToken(user._id);
-    const refreshToken = generateRefreshToken(user._id);
-
-    const userData = {
-      id: user._id,
-      name: user.name,
-      email: user.email,
-      currency: user.currency,
-      isVerified: true,
-      onboardingCompleted: user.onboardingCompleted,
-      preferences: user.preferences
-    };
+    const { token, refreshToken } = issueAuthTokens(user);
 
     return successResponse(
       res,
       {
-        user: userData,
+        user: buildUserPayload(user),
         token,
-        refreshToken
+        refreshToken,
       },
       'Email verified successfully'
     );
@@ -430,43 +462,40 @@ exports.verifyEmail = async (req, res, next) => {
  * @desc    Resend OTP for email verification
  * @access  Public
  */
-exports.resendOTP = async (req, res, next) => {
+exports.resendOTP = async (req, res) => {
   try {
-    // Validation is handled by middleware
     const { email } = req.body;
+    const user = await findUserByEmail(email);
 
-    // Find user
-    const user = await User.findOne({ email });
     if (!user) {
-      // Don't reveal if user exists for security
-      return successResponse(
-        res,
-        { message: 'If email exists, OTP has been sent' },
-        'OTP sent successfully'
-      );
+      return sendEmailNotFoundResponse(res);
     }
 
-    // Check if already verified
     if (user.isVerified) {
-      return successResponse(
+      return sendEmailVerificationStatusResponse(
         res,
-        { message: 'Email is already verified' },
-        'Email is already verified'
+        'This email is already verified. Please sign in instead.',
+        409,
+        'EMAIL_ALREADY_VERIFIED'
       );
     }
 
-    // Generate new OTP
-    const otp = user.generateOTP();
-    await user.save();
+    const resendStatus = user.canResendOTP(otpService.OTP_PURPOSES.EMAIL_VERIFICATION);
+    if (!resendStatus.allowed) {
+      return errorResponse(res, 'Please wait before requesting another code', 429, {
+        code: 'OTP_RESEND_TOO_SOON',
+        retryAfterSeconds: resendStatus.secondsRemaining,
+      });
+    }
 
-    // Send OTP via email
-    await otpService.sendOTPEmail(user.email, otp, 'email-verification');
+    await sendOtpVerification(user, otpService.OTP_PURPOSES.EMAIL_VERIFICATION);
 
     return successResponse(
       res,
       {
         message: 'OTP sent to your email',
-        expiresIn: `${otpService.getOTPExpiryMinutes()} minutes`
+        expiresIn: `${otpService.getOTPExpiryMinutes()} minutes`,
+        resendAvailableInSeconds: otpService.OTP_RESEND_COOLDOWN_SECONDS,
       },
       'OTP sent successfully. Please check your email.'
     );
@@ -477,11 +506,56 @@ exports.resendOTP = async (req, res, next) => {
 };
 
 /**
+ * @route   POST /api/v1/auth/resend-password-reset-otp
+ * @desc    Resend OTP for password reset
+ * @access  Public
+ */
+exports.resendPasswordResetOTP = async (req, res) => {
+  try {
+    const { email } = req.body;
+    const user = await findUserByEmail(email);
+
+    if (!user) {
+      return sendEmailNotFoundResponse(res);
+    }
+
+    if (!user.isVerified) {
+      return sendEmailVerificationStatusResponse(
+        res,
+        'Please verify your email before requesting another reset code.'
+      );
+    }
+
+    const resendStatus = user.canResendOTP(otpService.OTP_PURPOSES.PASSWORD_RESET);
+    if (!resendStatus.allowed) {
+      return errorResponse(res, 'Please wait before requesting another code', 429, {
+        code: 'OTP_RESEND_TOO_SOON',
+        retryAfterSeconds: resendStatus.secondsRemaining,
+      });
+    }
+
+    await sendOtpVerification(user, otpService.OTP_PURPOSES.PASSWORD_RESET);
+    return successResponse(
+      res,
+      {
+        message: 'OTP sent to your email',
+        expiresIn: `${otpService.getOTPExpiryMinutes()} minutes`,
+        resendAvailableInSeconds: otpService.OTP_RESEND_COOLDOWN_SECONDS,
+      },
+      'OTP sent successfully. Please check your email.'
+    );
+  } catch (error) {
+    console.error('Resend password reset OTP error:', error);
+    return errorResponse(res, 'Failed to resend OTP', 500, error.message);
+  }
+};
+
+/**
  * @route   POST /api/v1/auth/refresh-token
  * @desc    Refresh access token
  * @access  Public
  */
-exports.refreshToken = async (req, res, next) => {
+exports.refreshToken = async (req, res) => {
   try {
     const { refreshToken } = req.body;
 
@@ -489,17 +563,18 @@ exports.refreshToken = async (req, res, next) => {
       return errorResponse(res, 'Refresh token is required', 400);
     }
 
-    // Verify refresh token
     const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
-    
-    // Check if user still exists
     const user = await User.findById(decoded.userId);
+
     if (!user) {
       return errorResponse(res, 'User not found', 404);
     }
 
-    // Generate new access token
-    const token = generateToken(user._id);
+    if ((decoded.tokenVersion || 0) !== (user.tokenVersion || 0)) {
+      return errorResponse(res, 'Invalid or expired refresh token', 401);
+    }
+
+    const token = generateToken(user);
 
     return successResponse(
       res,
@@ -510,6 +585,7 @@ exports.refreshToken = async (req, res, next) => {
     if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
       return errorResponse(res, 'Invalid or expired refresh token', 401);
     }
+
     console.error('Refresh token error:', error);
     return errorResponse(res, 'Failed to refresh token', 500, error.message);
   }

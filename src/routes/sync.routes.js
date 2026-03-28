@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const syncController = require('../controllers/sync.controller');
-const { protect } = require('../middleware/auth.middleware');
+const { protect, requireVerifiedEmail, requireOnboardingComplete } = require('../middleware/auth.middleware');
 
 /**
  * Sync Routes
@@ -16,7 +16,7 @@ const { protect } = require('../middleware/auth.middleware');
  */
 
 // All routes require authentication
-router.use(protect);
+router.use(protect, requireVerifiedEmail, requireOnboardingComplete);
 
 /**
  * @route   POST /api/v1/sync/all

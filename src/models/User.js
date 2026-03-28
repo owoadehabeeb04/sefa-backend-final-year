@@ -75,11 +75,25 @@ const userSchema = new mongoose.Schema({
     timestamp: Date
   },
   otp: {
-    code: String,
-    expiresAt: Date
+    codeHash: String,
+    purpose: {
+      type: String,
+      enum: [otpService.OTP_PURPOSES.EMAIL_VERIFICATION, otpService.OTP_PURPOSES.PASSWORD_RESET]
+    },
+    expiresAt: Date,
+    attempts: {
+      type: Number,
+      default: 0
+    },
+    lastSentAt: Date,
+    lockedUntil: Date
   },
   resetPasswordToken: String,
   resetPasswordExpires: Date,
+  tokenVersion: {
+    type: Number,
+    default: 0
+  },
   monthlyBudgetLimit: {
     type: Number,
     default: null,
@@ -103,25 +117,41 @@ userSchema.methods.comparePassword = async function(candidatePassword) {
 };
 
 // Method to generate OTP using OTP service
-userSchema.methods.generateOTP = function() {
+userSchema.methods.generateOTP = function(purpose = otpService.OTP_PURPOSES.EMAIL_VERIFICATION) {
   const otpData = otpService.generateOTP();
   this.otp = {
-    code: otpData.code,
+    ...otpService.createOTPRecord(otpData.code, purpose),
     expiresAt: otpData.expiresAt
   };
   return otpData.code;
 };
 
 // Method to verify OTP using OTP service
-userSchema.methods.verifyOTP = function(code) {
-  if (!this.otp || !this.otp.code) {
+userSchema.methods.verifyOTP = function(code, purpose) {
+  if (!this.otp || !this.otp.codeHash) {
     return { valid: false, message: 'OTP not found' };
   }
-  return otpService.verifyOTP(code, this.otp.code, this.otp.expiresAt);
+
+  const result = otpService.verifyOTP(code, this.otp, purpose);
+
+  if (!result.valid && typeof result.attempts === 'number') {
+    this.otp.attempts = result.attempts;
+    this.otp.lockedUntil = result.lockedUntil || null;
+  }
+
+  return result;
 };
 
 // Method to clear OTP
-userSchema.methods.clearOTP = function() {
+userSchema.methods.clearOTP = function(purpose = null) {
+  if (!this.otp) {
+    return;
+  }
+
+  if (purpose && this.otp.purpose && this.otp.purpose !== purpose) {
+    return;
+  }
+
   this.otp = undefined;
 };
 
@@ -129,6 +159,22 @@ userSchema.methods.clearOTP = function() {
 userSchema.methods.isOTPExpired = function() {
   if (!this.otp || !this.otp.expiresAt) return true;
   return otpService.isOTPExpired(this.otp.expiresAt);
+};
+
+userSchema.methods.canResendOTP = function(purpose) {
+  if (!this.otp || !this.otp.lastSentAt) {
+    return { allowed: true, secondsRemaining: 0 };
+  }
+
+  if (purpose && this.otp.purpose && this.otp.purpose !== purpose) {
+    return { allowed: true, secondsRemaining: 0 };
+  }
+
+  return otpService.canResendOTP(this.otp);
+};
+
+userSchema.methods.bumpTokenVersion = function() {
+  this.tokenVersion = (this.tokenVersion || 0) + 1;
 };
 
 // Create index for cleanup of unverified users

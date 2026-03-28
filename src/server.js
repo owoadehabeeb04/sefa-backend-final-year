@@ -16,14 +16,60 @@ const { assertBrevoConfigured } = require('./services/otpService');
 
 const app = express();
 
+const MIN_SECRET_LENGTH = 32;
+
+const parseCorsOrigins = () => {
+  return (process.env.CORS_ORIGIN || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+};
+
+const assertSecureRuntimeConfig = () => {
+  if (process.env.NODE_ENV === 'test') {
+    return;
+  }
+
+  const insecureMarkers = ['change-this', 'replace-with', 'replace_', 'your-', 'example'];
+  const requiredSecrets = [
+    { key: 'JWT_SECRET', value: process.env.JWT_SECRET },
+    { key: 'JWT_REFRESH_SECRET', value: process.env.JWT_REFRESH_SECRET },
+    { key: 'ADMIN_SECRET_KEY', value: process.env.ADMIN_SECRET_KEY },
+    { key: 'MONO_WEBHOOK_SECRET', value: process.env.MONO_WEBHOOK_SECRET },
+  ];
+
+  for (const secret of requiredSecrets) {
+    if (!secret.value || secret.value.length < MIN_SECRET_LENGTH) {
+      throw new Error(`${secret.key} must be set to a secure value at least ${MIN_SECRET_LENGTH} characters long`);
+    }
+
+    const normalized = secret.value.toLowerCase();
+    if (insecureMarkers.some((marker) => normalized.includes(marker))) {
+      throw new Error(`${secret.key} is using an insecure placeholder value`);
+    }
+  }
+
+  const corsOrigins = parseCorsOrigins();
+  if (corsOrigins.length === 0 || corsOrigins.includes('*')) {
+    throw new Error('CORS_ORIGIN must be an explicit comma-separated allowlist and cannot contain "*"');
+  }
+};
+
 // Swagger documentation
 swaggerSetup(app);
 
 // Middleware
 app.use(helmet());
+const corsOrigins = parseCorsOrigins();
 app.use(cors({
-  origin: process.env.CORS_ORIGIN?.split(',') || '*',
-  credentials: true
+  origin(origin, callback) {
+    if (!origin || corsOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error('Origin not allowed by CORS'));
+  },
+  credentials: true,
 }));
 app.use(express.json({
   verify: (req, res, buffer) => {
@@ -91,6 +137,7 @@ const getNetworkUrls = () => {
 
 const bootstrap = async () => {
   try {
+    assertSecureRuntimeConfig();
     assertBrevoConfigured();
 
     // Connect to MongoDB first

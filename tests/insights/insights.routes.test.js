@@ -167,11 +167,13 @@ describe('Insights routes', () => {
       name: 'Insight Tester',
       email: 'insight@example.com',
       password: 'SecurePass123!',
+      isVerified: true,
       monthlyBudgetLimit: 150000,
       onboardingCompleted: true,
+      onboardingStatus: 'completed',
     });
 
-    authHeader = `Bearer ${jwt.sign({ userId: String(user._id) }, process.env.JWT_SECRET)}`;
+    authHeader = `Bearer ${jwt.sign({ userId: String(user._id), tokenVersion: user.tokenVersion || 0 }, process.env.JWT_SECRET)}`;
     await seedInsightData(user._id);
   });
 
@@ -276,10 +278,12 @@ describe('Insights routes', () => {
       name: 'Fresh User',
       email: 'fresh-insight@example.com',
       password: 'SecurePass123!',
+      isVerified: true,
       monthlyBudgetLimit: 50000,
       onboardingCompleted: true,
+      onboardingStatus: 'completed',
     });
-    const emptyAuthHeader = `Bearer ${jwt.sign({ userId: String(emptyUser._id) }, process.env.JWT_SECRET)}`;
+    const emptyAuthHeader = `Bearer ${jwt.sign({ userId: String(emptyUser._id), tokenVersion: emptyUser.tokenVersion || 0 }, process.env.JWT_SECRET)}`;
 
     const response = await request(app)
       .get('/api/v1/insights/hub')

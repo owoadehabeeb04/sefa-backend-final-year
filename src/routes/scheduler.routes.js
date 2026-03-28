@@ -10,13 +10,13 @@ const {
   testWeeklySummary,
   testSpendingInsights
 } = require('../controllers/scheduler.controller');
-const { protect } = require('../middleware/auth');
+const { protect, requireVerifiedEmail, requireOnboardingComplete } = require('../middleware/auth');
 const { requireAdmin } = require('../middleware/requireAdmin');
 
 // Public routes (none)
 
 // Protected routes (user)
-router.use(protect);
+router.use(protect, requireVerifiedEmail, requireOnboardingComplete);
 
 // Test endpoints for users to test their own notifications
 router.post('/test/budget-check', testBudgetCheck);

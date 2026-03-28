@@ -51,6 +51,67 @@ const authLimiter = rateLimit({
 });
 
 /**
+ * OTP/code request limiter
+ * Counts successful requests too, since OTP send endpoints intentionally respond generically.
+ */
+const otpRequestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: {
+    success: false,
+    message: 'Too many code requests, please try again later.'
+  },
+  handler: (req, res) => {
+    console.warn(`⚠️  OTP request rate limit exceeded for IP: ${req.ip}`);
+    res.status(429).json({
+      success: false,
+      message: 'Too many code requests. Please try again after 15 minutes.',
+      retryAfter: req.rateLimit.resetTime
+    });
+  }
+});
+
+/**
+ * OTP/code verification limiter
+ */
+const otpVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: {
+    success: false,
+    message: 'Too many verification attempts, please try again later.'
+  },
+  handler: (req, res) => {
+    console.warn(`⚠️  OTP verification rate limit exceeded for IP: ${req.ip}`);
+    res.status(429).json({
+      success: false,
+      message: 'Too many verification attempts. Please try again after 15 minutes.',
+      retryAfter: req.rateLimit.resetTime
+    });
+  }
+});
+
+/**
+ * Refresh token limiter
+ */
+const refreshTokenLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: {
+    success: false,
+    message: 'Too many token refresh requests, please try again later.'
+  },
+  handler: (req, res) => {
+    console.warn(`⚠️  Refresh token rate limit exceeded for IP: ${req.ip}`);
+    res.status(429).json({
+      success: false,
+      message: 'Too many token refresh requests. Please try again later.',
+      retryAfter: req.rateLimit.resetTime
+    });
+  }
+});
+
+/**
  * File upload rate limiter
  * 10 uploads per hour per IP
  */
@@ -162,6 +223,9 @@ const createLimiter = (windowMs, max, message) => {
 module.exports = {
   apiLimiter,
   authLimiter,
+  otpRequestLimiter,
+  otpVerifyLimiter,
+  refreshTokenLimiter,
   uploadLimiter,
   webhookLimiter,
   transactionLimiter,

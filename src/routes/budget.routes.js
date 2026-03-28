@@ -12,11 +12,11 @@ const {
   bulkCreateBudgets,
   renewBudget
 } = require('../controllers/budget.controller');
-const { protect } = require('../middleware/auth');
+const { protect, requireVerifiedEmail, requireOnboardingComplete } = require('../middleware/auth');
 const { validateBudget } = require('../middleware/validateBudget');
 
 // All routes require authentication
-router.use(protect);
+router.use(protect, requireVerifiedEmail, requireOnboardingComplete);
 
 // Summary endpoint (must be before /:id routes)
 router.get('/summary', getBudgetSummary);

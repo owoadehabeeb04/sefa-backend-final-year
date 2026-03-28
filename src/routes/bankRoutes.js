@@ -2,13 +2,19 @@ const express = require('express');
 const router = express.Router();
 
 const bankController = require('../controllers/bankConnectionController');
-const { authenticate } = require('../middleware/auth.middleware');
+const {
+  authenticate,
+  requireVerifiedEmail,
+  requireOnboardingComplete,
+} = require('../middleware/auth.middleware');
 const { handleFileUpload } = require('../middleware/upload.middleware');
 const { 
   verifyMonoWebhook, 
   logWebhookEvent, 
   handleWebhookEvent 
 } = require('../middleware/webhookAuth.middleware');
+
+const gated = [authenticate, requireVerifiedEmail, requireOnboardingComplete];
 
 /**
  * Bank Connection Routes
@@ -25,35 +31,35 @@ const {
  * @access  Private
  * @body    { code: string }
  */
-router.post('/connect', authenticate, bankController.connectBankAccount);
+router.post('/connect', gated, bankController.connectBankAccount);
 
 /**
  * @route   GET /api/bank/connections
  * @desc    Get all user's bank connections
  * @access  Private
  */
-router.get('/connections', authenticate, bankController.getBankConnections);
+router.get('/connections', gated, bankController.getBankConnections);
 
 /**
  * @route   GET /api/bank/connections/:id
  * @desc    Get single bank connection
  * @access  Private
  */
-router.get('/connections/:id', authenticate, bankController.getBankConnection);
+router.get('/connections/:id', gated, bankController.getBankConnection);
 
 /**
  * @route   POST /api/bank/connections/:id/sync
  * @desc    Manually trigger bank sync
  * @access  Private
  */
-router.post('/connections/:id/sync', authenticate, bankController.syncBankTransactions);
+router.post('/connections/:id/sync', gated, bankController.syncBankTransactions);
 
 /**
  * @route   DELETE /api/bank/connections/:id
  * @desc    Disconnect bank account
  * @access  Private
  */
-router.delete('/connections/:id', authenticate, bankController.disconnectBankAccount);
+router.delete('/connections/:id', gated, bankController.disconnectBankAccount);
 
 /**
  * @route   POST /api/bank/upload
@@ -61,14 +67,14 @@ router.delete('/connections/:id', authenticate, bankController.disconnectBankAcc
  * @access  Private
  * @body    FormData with 'file' field
  */
-router.post('/upload', authenticate, handleFileUpload, bankController.uploadBankStatement);
+router.post('/upload', gated, handleFileUpload, bankController.uploadBankStatement);
 
 /**
  * @route   GET /api/bank/import/:jobId
  * @desc    Get import job status
  * @access  Private
  */
-router.get('/import/:jobId', authenticate, bankController.getImportJobStatus);
+router.get('/import/:jobId', gated, bankController.getImportJobStatus);
 
 /**
  * @route   GET /api/bank/imports
@@ -76,14 +82,14 @@ router.get('/import/:jobId', authenticate, bankController.getImportJobStatus);
  * @access  Private
  * @query   { page: number, limit: number }
  */
-router.get('/imports', authenticate, bankController.getImportHistory);
+router.get('/imports', gated, bankController.getImportHistory);
 
 /**
  * @route   POST /api/bank/import/:jobId/undo
  * @desc    Undo import (delete imported transactions)
  * @access  Private
  */
-router.post('/import/:jobId/undo', authenticate, bankController.undoImport);
+router.post('/import/:jobId/undo', gated, bankController.undoImport);
 
 // ============================================
 // WEBHOOK ROUTES (No JWT, uses signature)

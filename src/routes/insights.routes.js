@@ -1,12 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const { protect } = require('../middleware/auth');
+const { protect, requireVerifiedEmail, requireOnboardingComplete } = require('../middleware/auth');
 const insightsController = require('../controllers/insights.controller');
 
 /**
  * All routes require authentication
  */
-router.use(protect);
+router.use(protect, requireVerifiedEmail, requireOnboardingComplete);
 
 /**
  * @swagger

@@ -156,6 +156,15 @@ exports.validateRefreshToken = [
   handleValidationErrors
 ];
 
+// Logout validation
+exports.validateLogout = [
+  body('refreshToken')
+    .notEmpty()
+    .withMessage('Refresh token is required'),
+
+  handleValidationErrors
+];
+
 // Verify email validation
 exports.validateVerifyEmail = [
   body('email')
@@ -177,6 +186,27 @@ exports.validateVerifyEmail = [
   handleValidationErrors
 ];
 
+// Verify password reset OTP validation
+exports.validateVerifyPasswordResetOTP = [
+  body('email')
+    .trim()
+    .notEmpty()
+    .withMessage('Email is required')
+    .isEmail()
+    .withMessage('Please provide a valid email')
+    .normalizeEmail(),
+
+  body('otp')
+    .notEmpty()
+    .withMessage('OTP is required')
+    .isLength({ min: 6, max: 6 })
+    .withMessage('OTP must be 6 digits')
+    .isNumeric()
+    .withMessage('OTP must be numeric'),
+
+  handleValidationErrors
+];
+
 // Resend OTP validation
 exports.validateResendOTP = [
   body('email')
@@ -187,6 +217,19 @@ exports.validateResendOTP = [
     .withMessage('Please provide a valid email')
     .normalizeEmail(),
   
+  handleValidationErrors
+];
+
+// Resend password reset OTP validation
+exports.validateResendPasswordResetOTP = [
+  body('email')
+    .trim()
+    .notEmpty()
+    .withMessage('Email is required')
+    .isEmail()
+    .withMessage('Please provide a valid email')
+    .normalizeEmail(),
+
   handleValidationErrors
 ];
 
