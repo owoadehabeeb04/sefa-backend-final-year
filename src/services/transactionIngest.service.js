@@ -117,6 +117,11 @@ const normalizeRecord = (record, context, index) => {
 
   const normalized = {
     amount,
+    balance:
+      record.balance === null || record.balance === undefined || record.balance === ''
+        ? null
+        : Number(record.balance),
+    categoryId: record.categoryId || null,
     description,
     direction,
     postedAt,
@@ -148,7 +153,7 @@ const getOrCreateCategory = async (userId, type, name, cache, overrides = {}) =>
     type,
     name,
     isActive: true,
-  }).select('_id name').lean();
+  }).select('_id name icon color type').lean();
 
   if (!category) {
     try {
@@ -161,7 +166,13 @@ const getOrCreateCategory = async (userId, type, name, cache, overrides = {}) =>
         source: 'system',
         isActive: true,
       });
-      category = { _id: created._id, name: created.name };
+      category = {
+        _id: created._id,
+        name: created.name,
+        icon: created.icon,
+        color: created.color,
+        type: created.type,
+      };
     } catch (error) {
       if (error?.code !== 11000) {
         throw error;
@@ -172,7 +183,7 @@ const getOrCreateCategory = async (userId, type, name, cache, overrides = {}) =>
         type,
         name,
         isActive: true,
-      }).select('_id name').lean();
+      }).select('_id name icon color type').lean();
     }
   }
 
@@ -182,8 +193,8 @@ const getOrCreateCategory = async (userId, type, name, cache, overrides = {}) =>
 
 const loadUserCategories = async (userId) => {
   const [expenseCategories, incomeCategories] = await Promise.all([
-    Category.find({ userId, type: 'expense', isActive: true }).select('_id name').lean(),
-    Category.find({ userId, type: 'income', isActive: true }).select('_id name').lean(),
+    Category.find({ userId, type: 'expense', isActive: true }).select('_id name icon color type').lean(),
+    Category.find({ userId, type: 'income', isActive: true }).select('_id name icon color type').lean(),
   ]);
 
   return {
@@ -201,6 +212,24 @@ const resolveCategories = async (entries, userId, options = {}) => {
   for (let index = 0; index < entries.length; index += 1) {
     const entry = entries[index];
     const type = directionToType(entry.direction);
+    const explicitCategoryId = entry.categoryId ? String(entry.categoryId) : null;
+
+    if (explicitCategoryId) {
+      const explicitCategory = categoriesByType[type].find(
+        (category) => String(category._id) === explicitCategoryId,
+      );
+
+      if (explicitCategory) {
+        resolved[index] = {
+          categoryId: explicitCategory._id,
+          categoryName: explicitCategory.name,
+          categoryIcon: explicitCategory.icon || 'folder',
+          categoryColor: explicitCategory.color || '#95A5A6',
+          usedFallback: false,
+        };
+        continue;
+      }
+    }
 
     if (entry.isTransfer) {
       const category = await getOrCreateCategory(userId, type, 'Transfer', categoryCache, {
@@ -210,6 +239,8 @@ const resolveCategories = async (entries, userId, options = {}) => {
       resolved[index] = {
         categoryId: category._id,
         categoryName: category.name,
+        categoryIcon: category.icon || 'swap-horizontal',
+        categoryColor: category.color || '#16A34A',
         usedFallback: false,
       };
       continue;
@@ -226,6 +257,8 @@ const resolveCategories = async (entries, userId, options = {}) => {
       resolved[index] = {
         categoryId: deterministic.categoryId,
         categoryName: deterministic.categoryName,
+        categoryIcon: deterministic.categoryIcon || 'folder',
+        categoryColor: deterministic.categoryColor || '#95A5A6',
         usedFallback: false,
       };
       continue;
@@ -254,6 +287,8 @@ const resolveCategories = async (entries, userId, options = {}) => {
           resolved[index] = {
             categoryId: result.categoryId,
             categoryName: result.categoryName,
+            categoryIcon: result.categoryIcon || 'folder',
+            categoryColor: result.categoryColor || '#95A5A6',
             usedFallback: false,
           };
         }
@@ -273,11 +308,111 @@ const resolveCategories = async (entries, userId, options = {}) => {
     resolved[index] = {
       categoryId: category._id,
       categoryName: category.name,
+      categoryIcon: category.icon || 'folder',
+      categoryColor: category.color || '#95A5A6',
       usedFallback: true,
     };
   }
 
   return resolved;
+};
+
+const buildDraftRows = async (records, context, options = {}) => {
+  const issues = [];
+  const normalizedEntries = [];
+  const seenMappingExternalIds = new Set();
+  let skippedCount = 0;
+
+  for (let index = 0; index < records.length; index += 1) {
+    const { transaction, error } = normalizeRecord(records[index], context, index);
+
+    if (error) {
+      skippedCount += 1;
+      pushIssue(issues, error);
+      continue;
+    }
+
+    const issueFlags = [];
+
+    if (seenMappingExternalIds.has(transaction.mappingExternalId)) {
+      issueFlags.push('duplicate_in_upload');
+    } else {
+      seenMappingExternalIds.add(transaction.mappingExternalId);
+    }
+
+    if (options.ocrProvider) {
+      issueFlags.push('ocr_extracted');
+    }
+
+    normalizedEntries.push({
+      originalRowIndex: index,
+      transaction,
+      issueFlags,
+      sourceText: String(
+        records[index]?.sourceText
+          || records[index]?.rawText
+          || records[index]?.description
+          || records[index]?.narration
+          || transaction.description,
+      ).trim(),
+      rawData: records[index]?.rawData || records[index],
+    });
+  }
+
+  const categorySuggestions = await resolveCategories(
+    normalizedEntries.map((entry) => ({
+      ...entry.transaction,
+      isTransfer: false,
+      pairKey: null,
+    })),
+    context.userId,
+    {
+      allowAi: options.allowAi !== false,
+    },
+  );
+
+  const rows = normalizedEntries.map((entry, index) => {
+    const suggestion = categorySuggestions[index];
+    const score =
+      3
+      - (options.ocrProvider ? 1 : 0)
+      - (entry.issueFlags.length ? 1 : 0)
+      - (suggestion?.usedFallback ? 1 : 0)
+      - (['low', 'unknown'].includes(options.bankDetectionConfidence) ? 1 : 0);
+
+    const confidence = score >= 3 ? 'high' : score >= 2 ? 'medium' : 'low';
+
+    return {
+      originalRowIndex: entry.originalRowIndex,
+      date: entry.transaction.postedAt,
+      description: entry.transaction.description,
+      amount: entry.transaction.amount,
+      direction: entry.transaction.direction,
+      balance: entry.transaction.balance ?? null,
+      reference: entry.transaction.reference || null,
+      suggestedCategoryId: suggestion?.categoryId || null,
+      suggestedCategoryName: suggestion?.categoryName || null,
+      suggestedCategoryIcon: suggestion?.categoryIcon || 'folder',
+      suggestedCategoryColor: suggestion?.categoryColor || '#95A5A6',
+      categoryId: null,
+      categoryName: null,
+      categoryIcon: null,
+      categoryColor: null,
+      confidence,
+      issueFlags: entry.issueFlags,
+      excluded: false,
+      sourceText: entry.sourceText || entry.transaction.description,
+      mappingExternalId: entry.transaction.mappingExternalId,
+      scopedExternalId: entry.transaction.scopedExternalId,
+      rawData: entry.rawData,
+    };
+  });
+
+  return {
+    rows,
+    skippedCount,
+    issues,
+  };
 };
 
 const findExistingSourceMappings = async (context, externalIds) => {
@@ -716,6 +851,7 @@ const ingestTransactions = async (input, context, options = {}) => {
 };
 
 module.exports = {
+  buildDraftRows,
   buildScopedExternalId,
   buildSyntheticExternalId,
   ingestTransactions,

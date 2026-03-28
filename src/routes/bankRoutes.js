@@ -77,6 +77,41 @@ router.post('/upload', gated, handleFileUpload, bankController.uploadBankStateme
 router.get('/import/:jobId', gated, bankController.getImportJobStatus);
 
 /**
+ * @route   POST /api/bank/import/:jobId/select-bank
+ * @desc    Select bank for a paused import job
+ * @access  Private
+ */
+router.post('/import/:jobId/select-bank', gated, bankController.selectImportBank);
+
+/**
+ * @route   GET /api/bank/import/:jobId/draft
+ * @desc    Get draft rows for review before import
+ * @access  Private
+ */
+router.get('/import/:jobId/draft', gated, bankController.getImportDraft);
+
+/**
+ * @route   PATCH /api/bank/import/:jobId/draft/:rowId
+ * @desc    Update a draft row before import
+ * @access  Private
+ */
+router.patch('/import/:jobId/draft/:rowId', gated, bankController.updateImportDraftRow);
+
+/**
+ * @route   DELETE /api/bank/import/:jobId/draft/:rowId
+ * @desc    Delete a draft row before import
+ * @access  Private
+ */
+router.delete('/import/:jobId/draft/:rowId', gated, bankController.deleteImportDraftRow);
+
+/**
+ * @route   POST /api/bank/import/:jobId/confirm
+ * @desc    Confirm a draft and start final import
+ * @access  Private
+ */
+router.post('/import/:jobId/confirm', gated, bankController.confirmImportDraft);
+
+/**
  * @route   GET /api/bank/imports
  * @desc    Get import history
  * @access  Private

@@ -54,7 +54,17 @@ const importJobSchema = new mongoose.Schema({
   status: {
     type: String,
     required: true,
-    enum: ['pending', 'queued', 'processing', 'completed', 'failed', 'undone'],
+    enum: [
+      'pending',
+      'queued',
+      'processing',
+      'needs_bank_selection',
+      'needs_review',
+      'importing',
+      'completed',
+      'failed',
+      'undone',
+    ],
     default: 'queued',
     index: true
   },
@@ -65,6 +75,9 @@ const importJobSchema = new mongoose.Schema({
       'download',
       'parse',
       'ocr',
+      'needs_bank_selection',
+      'needs_review',
+      'importing',
       'normalize',
       'deduplicate',
       'categorize',
@@ -196,6 +209,75 @@ const importJobSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  documentIdentityReasons: [{
+    type: String,
+  }],
+  bankSelection: {
+    required: {
+      type: Boolean,
+      default: false,
+    },
+    reason: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    requestedAt: {
+      type: Date,
+      default: null,
+    },
+    selectedBankSlug: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    selectedBankDisplayName: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    selectedAt: {
+      type: Date,
+      default: null,
+    },
+  },
+  draftSummary: {
+    totalRows: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    includedRows: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    excludedRows: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    debitTotal: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    creditTotal: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    lowConfidenceRows: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    flaggedRows: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+  },
 
   // Undo tracking
   isUndone: {
@@ -291,6 +373,12 @@ importJobSchema.methods.updateProgress = async function(stage, progress) {
   } else if (this.stage === 'failed') {
     this.status = 'failed';
     this.completedAt = new Date();
+  } else if (this.stage === 'needs_bank_selection') {
+    this.status = 'needs_bank_selection';
+  } else if (this.stage === 'needs_review') {
+    this.status = 'needs_review';
+  } else if (this.stage === 'importing') {
+    this.status = 'importing';
   } else if (this.stage === 'queued') {
     this.status = 'queued';
   } else {
@@ -358,8 +446,26 @@ const normalizeSerializedImportJob = (_doc, ret) => {
   ret.detectedBankDisplayName = ret.detectedBankDisplayName || 'Unknown bank';
   ret.bankDetectionConfidence = ret.bankDetectionConfidence || 'unknown';
   ret.bankDetectionSource = ret.bankDetectionSource || 'unknown';
+  ret.documentIdentityReasons = ret.documentIdentityReasons || [];
   ret.qualityFlags = ret.qualityFlags || [];
   ret.needsReview = Boolean(ret.needsReview);
+  ret.bankSelection = ret.bankSelection || {
+    required: false,
+    reason: null,
+    requestedAt: null,
+    selectedBankSlug: null,
+    selectedBankDisplayName: null,
+    selectedAt: null,
+  };
+  ret.draftSummary = ret.draftSummary || {
+    totalRows: 0,
+    includedRows: 0,
+    excludedRows: 0,
+    debitTotal: 0,
+    creditTotal: 0,
+    lowConfidenceRows: 0,
+    flaggedRows: 0,
+  };
   return ret;
 };
 

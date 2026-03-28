@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const BankConnection = require('../models/BankConnection');
+const ImportDraftRow = require('../models/ImportDraftRow');
 const ImportJob = require('../models/ImportJob');
 const ImportedTransactionMap = require('../models/ImportedTransactionMap');
 const SyncLog = require('../models/SyncLog');
@@ -12,6 +13,15 @@ const ocrService = require('../services/ocr.service');
 const deduplicationService = require('../services/deduplication.service');
 const transferService = require('../services/transfer.service');
 const syncScheduler = require('../services/syncScheduler.service');
+const {
+  getDraftRows,
+  getImportBankOptions,
+  normalizeDraftDirection,
+  refreshImportJobDraftSummary,
+  suggestDraftCategory,
+  validateCategoryForDraft,
+} = require('../services/importDraft.service');
+const { findBankProfile, resolveBankProfile } = require('../services/bankProfiles');
 const { normalizeImportStage, normalizeImportStatus } = require('../utils/importJobState');
 
 const { addImportJob, getJobStatus } = require('../config/queue');
@@ -29,6 +39,52 @@ const normalizeAccountNumberHint = (value) => {
   }
 
   return digits.slice(-4);
+};
+
+const serializeImportJob = (job) => {
+  const serialized = job?.toJSON ? job.toJSON() : job;
+
+  if (!serialized) {
+    return serialized;
+  }
+
+  if (serialized.status === 'needs_bank_selection') {
+    return {
+      ...serialized,
+      availableBanks: getImportBankOptions(),
+    };
+  }
+
+  return serialized;
+};
+
+const queueImportAction = async ({ importJob, fileType, action }) => {
+  const queueJob = await addImportJob({
+    action,
+    importJobId: String(importJob._id),
+    userId: String(importJob.userId),
+    source: importJob.source,
+    fileId: importJob.fileId?.toString(),
+    fileName: importJob.fileName,
+    fileType,
+    fileSize: importJob.fileSize,
+  });
+
+  importJob.queueJobId = String(queueJob.id);
+  await importJob.save();
+
+  return queueJob;
+};
+
+const getOwnedImportJob = async (jobId, userId) => {
+  if (!mongoose.isValidObjectId(jobId)) {
+    return null;
+  }
+
+  return ImportJob.findOne({
+    _id: jobId,
+    userId,
+  });
 };
 
 /**
@@ -388,6 +444,7 @@ const uploadBankStatement = async (req, res) => {
     
     // Determine file type
     const fileType = fileMetadata.mimeType === 'application/pdf' ? 'pdf' : 'csv';
+    const hintedProfile = bankHint ? resolveBankProfile(bankHint) || null : null;
 
     const importJob = await ImportJob.create({
       userId,
@@ -403,21 +460,24 @@ const uploadBankStatement = async (req, res) => {
       accountNumberHint,
       warnings: [],
       errorMessages: [],
+      bankSelection: hintedProfile
+        ? {
+            required: false,
+            reason: null,
+            requestedAt: null,
+            selectedBankSlug: hintedProfile.slug,
+            selectedBankDisplayName: hintedProfile.displayName,
+            selectedAt: new Date(),
+          }
+        : undefined,
     });
 
     try {
-      const queueJob = await addImportJob({
-        importJobId: String(importJob._id),
-        userId,
-        source: importJob.source,
-        fileId: fileId.toString(),
-        fileName: fileMetadata.originalName,
+      const queueJob = await queueImportAction({
+        importJob,
         fileType,
-        fileSize: fileMetadata.size,
+        action: 'prepare-draft',
       });
-
-      importJob.queueJobId = String(queueJob.id);
-      await importJob.save();
 
       return res.status(202).json({
         success: true,
@@ -431,6 +491,7 @@ const uploadBankStatement = async (req, res) => {
           status: 'queued',
           bankHint,
           accountNumberHint,
+          reviewRequired: true,
         }
       });
     } catch (queueError) {
@@ -478,7 +539,7 @@ const getImportJobStatus = async (req, res) => {
 
       return res.json({
         success: true,
-        data: job
+        data: serializeImportJob(job)
       });
     }
 
@@ -490,7 +551,7 @@ const getImportJobStatus = async (req, res) => {
     if (legacyImportJob) {
       return res.json({
         success: true,
-        data: legacyImportJob
+        data: serializeImportJob(legacyImportJob)
       });
     }
 
@@ -530,7 +591,7 @@ const getImportJobStatus = async (req, res) => {
     if (importJob) {
       return res.json({
         success: true,
-        data: importJob,
+        data: serializeImportJob(importJob),
         queue: {
           id: queueJob.id,
           state: queueJob.state,
@@ -588,6 +649,462 @@ const getImportJobStatus = async (req, res) => {
 };
 
 /**
+ * Select bank for a paused import job
+ * POST /api/bank/import/:jobId/select-bank
+ */
+const selectImportBank = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const { bankSlug } = req.body;
+    const userId = req.user.userId;
+
+    const job = await getOwnedImportJob(jobId, userId);
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: 'Import job not found',
+      });
+    }
+
+    if (normalizeImportStatus(job.status) !== 'needs_bank_selection') {
+      return res.status(409).json({
+        success: false,
+        message: 'This import does not need bank selection right now',
+      });
+    }
+
+    const normalizedBankSlug = String(bankSlug || '').trim().toLowerCase();
+
+    if (!normalizedBankSlug) {
+      return res.status(400).json({
+        success: false,
+        message: 'bankSlug is required',
+      });
+    }
+
+    const selectedProfile =
+      normalizedBankSlug === 'generic'
+        ? { slug: 'generic', displayName: 'Other / Unsupported bank' }
+        : findBankProfile(normalizedBankSlug);
+
+    if (!selectedProfile) {
+      return res.status(400).json({
+        success: false,
+        message: 'Selected bank is not supported',
+      });
+    }
+
+    job.bankHint = selectedProfile.slug === 'generic' ? null : selectedProfile.displayName;
+    job.bankSelection = {
+      required: false,
+      reason: null,
+      requestedAt: job.bankSelection?.requestedAt || new Date(),
+      selectedBankSlug: selectedProfile.slug,
+      selectedBankDisplayName: selectedProfile.displayName,
+      selectedAt: new Date(),
+    };
+    job.status = 'queued';
+    job.stage = 'queued';
+    job.progress = 0;
+    job.needsReview = false;
+    job.errorMessages = [];
+    job.qualityFlags = (job.qualityFlags || []).filter((flag) => flag !== 'bank_selection_required');
+
+    const queueJob = await queueImportAction({
+      importJob: job,
+      fileType: job.fileType === 'application/pdf' ? 'pdf' : 'csv',
+      action: 'prepare-draft',
+    });
+
+    return res.status(202).json({
+      success: true,
+      message: 'Bank selected. Parsing will continue now.',
+      data: {
+        ...serializeImportJob(job),
+        queueJobId: String(queueJob.id),
+      },
+    });
+  } catch (error) {
+    console.error('❌ Select import bank error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to continue import after bank selection',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Get review draft rows for an import job
+ * GET /api/bank/import/:jobId/draft
+ */
+const getImportDraft = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.user.userId;
+
+    const job = await getOwnedImportJob(jobId, userId);
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: 'Import job not found',
+      });
+    }
+
+    const rows = await getDraftRows(job._id, userId);
+
+    if ((job.draftSummary?.totalRows || 0) !== rows.length) {
+      await refreshImportJobDraftSummary(job);
+      await job.save();
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        importJobId: job._id,
+        status: normalizeImportStatus(job.status),
+        summary: job.draftSummary,
+        rows,
+      },
+    });
+  } catch (error) {
+    console.error('❌ Get import draft error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to fetch import draft',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Update a review draft row
+ * PATCH /api/bank/import/:jobId/draft/:rowId
+ */
+const updateImportDraftRow = async (req, res) => {
+  try {
+    const { jobId, rowId } = req.params;
+    const userId = req.user.userId;
+
+    const job = await getOwnedImportJob(jobId, userId);
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: 'Import job not found',
+      });
+    }
+
+    if (normalizeImportStatus(job.status) !== 'needs_review') {
+      return res.status(409).json({
+        success: false,
+        message: 'Draft rows can only be edited while review is pending',
+      });
+    }
+
+    const draftRow = await ImportDraftRow.findOne({
+      _id: rowId,
+      importJobId: job._id,
+      userId,
+    });
+
+    if (!draftRow) {
+      return res.status(404).json({
+        success: false,
+        message: 'Draft row not found',
+      });
+    }
+
+    const updates = req.body || {};
+    let shouldResuggest = false;
+
+    if (Object.prototype.hasOwnProperty.call(updates, 'direction')) {
+      const normalizedDirection = normalizeDraftDirection(updates.direction);
+
+      if (!normalizedDirection) {
+        return res.status(400).json({
+          success: false,
+          message: 'direction must be debit or credit',
+        });
+      }
+
+      if (normalizedDirection !== draftRow.direction) {
+        shouldResuggest = true;
+      }
+
+      draftRow.direction = normalizedDirection;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(updates, 'date')) {
+      const date = new Date(updates.date);
+
+      if (Number.isNaN(date.getTime())) {
+        return res.status(400).json({
+          success: false,
+          message: 'date must be a valid ISO date string',
+        });
+      }
+
+      draftRow.date = date;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(updates, 'description')) {
+      const description = String(updates.description || '').trim();
+
+      if (!description) {
+        return res.status(400).json({
+          success: false,
+          message: 'description is required',
+        });
+      }
+
+      draftRow.description = description;
+      shouldResuggest = true;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(updates, 'amount')) {
+      const amount = Number(updates.amount);
+
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'amount must be a positive number',
+        });
+      }
+
+      draftRow.amount = Math.abs(amount);
+      shouldResuggest = true;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(updates, 'reference')) {
+      draftRow.reference = String(updates.reference || '').trim() || null;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(updates, 'balance')) {
+      if (updates.balance === null || updates.balance === '' || updates.balance === undefined) {
+        draftRow.balance = null;
+      } else {
+        const balance = Number(updates.balance);
+
+        if (!Number.isFinite(balance)) {
+          return res.status(400).json({
+            success: false,
+            message: 'balance must be a number when provided',
+          });
+        }
+
+        draftRow.balance = balance;
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(updates, 'excluded')) {
+      if (typeof updates.excluded !== 'boolean') {
+        return res.status(400).json({
+          success: false,
+          message: 'excluded must be a boolean',
+        });
+      }
+
+      draftRow.excluded = updates.excluded;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(updates, 'categoryId')) {
+      if (!updates.categoryId) {
+        draftRow.categoryId = null;
+        draftRow.categoryName = null;
+        draftRow.categoryIcon = null;
+        draftRow.categoryColor = null;
+        shouldResuggest = true;
+      } else {
+        const category = await validateCategoryForDraft({
+          userId,
+          categoryId: updates.categoryId,
+          direction: draftRow.direction,
+        });
+
+        draftRow.categoryId = category._id;
+        draftRow.categoryName = category.name;
+        draftRow.categoryIcon = category.icon || 'folder';
+        draftRow.categoryColor = category.color || '#95A5A6';
+      }
+    } else if (shouldResuggest && draftRow.categoryId) {
+      try {
+        await validateCategoryForDraft({
+          userId,
+          categoryId: draftRow.categoryId,
+          direction: draftRow.direction,
+        });
+      } catch (_error) {
+        draftRow.categoryId = null;
+        draftRow.categoryName = null;
+        draftRow.categoryIcon = null;
+        draftRow.categoryColor = null;
+      }
+    }
+
+    if (shouldResuggest && !draftRow.categoryId) {
+      const suggestion = await suggestDraftCategory({
+        userId,
+        row: draftRow,
+        bankDetectionConfidence: job.bankDetectionConfidence,
+        ocrProvider: job.ocrProvider,
+      });
+
+      draftRow.suggestedCategoryId = suggestion?.suggestedCategoryId || null;
+      draftRow.suggestedCategoryName = suggestion?.suggestedCategoryName || null;
+      draftRow.suggestedCategoryIcon = suggestion?.suggestedCategoryIcon || null;
+      draftRow.suggestedCategoryColor = suggestion?.suggestedCategoryColor || null;
+      draftRow.confidence = suggestion?.confidence || draftRow.confidence;
+    }
+
+    await draftRow.save();
+    await refreshImportJobDraftSummary(job);
+    await job.save();
+
+    return res.json({
+      success: true,
+      message: 'Draft row updated',
+      data: {
+        row: draftRow,
+        summary: job.draftSummary,
+      },
+    });
+  } catch (error) {
+    console.error('❌ Update import draft row error:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to update draft row',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Delete a review draft row
+ * DELETE /api/bank/import/:jobId/draft/:rowId
+ */
+const deleteImportDraftRow = async (req, res) => {
+  try {
+    const { jobId, rowId } = req.params;
+    const userId = req.user.userId;
+
+    const job = await getOwnedImportJob(jobId, userId);
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: 'Import job not found',
+      });
+    }
+
+    if (normalizeImportStatus(job.status) !== 'needs_review') {
+      return res.status(409).json({
+        success: false,
+        message: 'Draft rows can only be deleted while review is pending',
+      });
+    }
+
+    const deleted = await ImportDraftRow.findOneAndDelete({
+      _id: rowId,
+      importJobId: job._id,
+      userId,
+    });
+
+    if (!deleted) {
+      return res.status(404).json({
+        success: false,
+        message: 'Draft row not found',
+      });
+    }
+
+    await refreshImportJobDraftSummary(job);
+    await job.save();
+
+    return res.json({
+      success: true,
+      message: 'Draft row deleted',
+      data: {
+        summary: job.draftSummary,
+      },
+    });
+  } catch (error) {
+    console.error('❌ Delete import draft row error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to delete draft row',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Confirm import draft and start final import
+ * POST /api/bank/import/:jobId/confirm
+ */
+const confirmImportDraft = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const userId = req.user.userId;
+
+    const job = await getOwnedImportJob(jobId, userId);
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: 'Import job not found',
+      });
+    }
+
+    if (normalizeImportStatus(job.status) !== 'needs_review') {
+      return res.status(409).json({
+        success: false,
+        message: 'This import is not ready for confirmation',
+      });
+    }
+
+    const rows = await getDraftRows(job._id, userId);
+    const includedRows = rows.filter((row) => !row.excluded);
+
+    if (!includedRows.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'At least one draft row must be included before confirming import',
+      });
+    }
+
+    job.status = 'importing';
+    job.stage = 'importing';
+    job.progress = 80;
+    job.needsReview = false;
+    job.errorMessages = [];
+
+    const queueJob = await queueImportAction({
+      importJob: job,
+      fileType: job.fileType === 'application/pdf' ? 'pdf' : 'csv',
+      action: 'confirm-import',
+    });
+
+    return res.status(202).json({
+      success: true,
+      message: 'Import confirmed. Final processing has started.',
+      data: {
+        ...serializeImportJob(job),
+        queueJobId: String(queueJob.id),
+      },
+    });
+  } catch (error) {
+    console.error('❌ Confirm import draft error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to confirm import',
+      error: error.message,
+    });
+  }
+};
+
+/**
  * Get import history
  * GET /api/bank/imports
  */
@@ -608,7 +1125,7 @@ const getImportHistory = async (req, res) => {
     
     res.json({
       success: true,
-      data: jobs,
+      data: jobs.map((job) => serializeImportJob(job)),
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
@@ -774,6 +1291,11 @@ module.exports = {
   disconnectBankAccount,
   uploadBankStatement,
   getImportJobStatus,
+  selectImportBank,
+  getImportDraft,
+  updateImportDraftRow,
+  deleteImportDraftRow,
+  confirmImportDraft,
   getImportHistory,
   undoImport,
   handleMonoWebhook
