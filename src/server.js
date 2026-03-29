@@ -6,7 +6,6 @@ const cors = require('cors');
 const morgan = require('morgan');
 const helmet = require('helmet');
 const connectDB = require('./config/database');
-const { initGridFS } = require('./config/gridfs');
 const { swaggerSetup } = require('./config/swagger');
 const { startCleanupJob } = require('./utils/cleanupJob');
 const { initializeProcessors, closeQueues } = require('./config/queue');
@@ -145,9 +144,6 @@ const bootstrap = async () => {
 
     // Start cleanup job only after MongoDB is ready
     startCleanupJob();
-
-    // Initialize GridFS after MongoDB is connected
-    initGridFS();
 
     // Initialize queue processors after DB connection
     initializeProcessors();

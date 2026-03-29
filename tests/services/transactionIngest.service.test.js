@@ -16,15 +16,17 @@ describe('transactionIngest.service', () => {
     ]);
   });
 
-  it('imports unique transactions and treats reruns as duplicates', async () => {
-    const importJobId = new mongoose.Types.ObjectId();
+  it('imports unique synced transactions and treats reruns as duplicates', async () => {
+    const syncLogId = new mongoose.Types.ObjectId();
+    const connectionId = new mongoose.Types.ObjectId();
     const context = {
       userId,
-      sourceType: 'import_job',
-      sourceRefId: importJobId,
-      importJobId,
-      provider: 'statement_csv',
-      externalIdScope: 'statement',
+      sourceType: 'bank_connection',
+      sourceRefId: connectionId,
+      importJobId: syncLogId,
+      syncLogId,
+      provider: 'mono',
+      externalIdScope: 'mono',
     };
 
     const transactions = [
@@ -66,6 +68,7 @@ describe('transactionIngest.service', () => {
         ...context,
         sourceRefId: new mongoose.Types.ObjectId(),
         importJobId: new mongoose.Types.ObjectId(),
+        syncLogId: new mongoose.Types.ObjectId(),
       },
       { allowAi: false },
     );
@@ -76,7 +79,8 @@ describe('transactionIngest.service', () => {
   });
 
   it('detects transfer pairs and links the saved transactions', async () => {
-    const importJobId = new mongoose.Types.ObjectId();
+    const syncLogId = new mongoose.Types.ObjectId();
+    const connectionId = new mongoose.Types.ObjectId();
 
     const result = await ingestTransactions(
       [
@@ -97,11 +101,12 @@ describe('transactionIngest.service', () => {
       ],
       {
         userId,
-        sourceType: 'import_job',
-        sourceRefId: importJobId,
-        importJobId,
-        provider: 'statement_csv',
-        externalIdScope: 'statement',
+        sourceType: 'bank_connection',
+        sourceRefId: connectionId,
+        importJobId: syncLogId,
+        syncLogId,
+        provider: 'mono',
+        externalIdScope: 'mono',
       },
       { allowAi: false },
     );

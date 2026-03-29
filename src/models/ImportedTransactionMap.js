@@ -3,7 +3,6 @@ const mongoose = require('mongoose');
 const importedTransactionMapSchema = new mongoose.Schema({
   importJobId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'ImportJob',
     default: null,
     index: true
   },

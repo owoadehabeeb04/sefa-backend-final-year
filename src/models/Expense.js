@@ -79,7 +79,6 @@ const expenseSchema = new mongoose.Schema({
   },
   importJobId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'ImportJob',
     default: null,
     sparse: true
   },

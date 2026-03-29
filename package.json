@@ -8,7 +8,9 @@
     "dev": "nodemon src/server.js",
     "test": "jest --runInBand",
     "test:watch": "jest --watch --runInBand",
-    "test:coverage": "jest --coverage --runInBand"
+    "test:coverage": "jest --coverage --runInBand",
+    "cleanup:statement-imports": "node scripts/cleanupStatementImports.js --dry-run",
+    "cleanup:statement-imports:apply": "node scripts/cleanupStatementImports.js --apply"
   },
   "keywords": [
     "financial",

@@ -7,7 +7,6 @@ const {
   requireVerifiedEmail,
   requireOnboardingComplete,
 } = require('../middleware/auth.middleware');
-const { handleFileUpload } = require('../middleware/upload.middleware');
 const { 
   verifyMonoWebhook, 
   logWebhookEvent, 
@@ -60,71 +59,6 @@ router.post('/connections/:id/sync', gated, bankController.syncBankTransactions)
  * @access  Private
  */
 router.delete('/connections/:id', gated, bankController.disconnectBankAccount);
-
-/**
- * @route   POST /api/bank/upload
- * @desc    Upload bank statement (CSV/PDF)
- * @access  Private
- * @body    FormData with 'file' field
- */
-router.post('/upload', gated, handleFileUpload, bankController.uploadBankStatement);
-
-/**
- * @route   GET /api/bank/import/:jobId
- * @desc    Get import job status
- * @access  Private
- */
-router.get('/import/:jobId', gated, bankController.getImportJobStatus);
-
-/**
- * @route   POST /api/bank/import/:jobId/select-bank
- * @desc    Select bank for a paused import job
- * @access  Private
- */
-router.post('/import/:jobId/select-bank', gated, bankController.selectImportBank);
-
-/**
- * @route   GET /api/bank/import/:jobId/draft
- * @desc    Get draft rows for review before import
- * @access  Private
- */
-router.get('/import/:jobId/draft', gated, bankController.getImportDraft);
-
-/**
- * @route   PATCH /api/bank/import/:jobId/draft/:rowId
- * @desc    Update a draft row before import
- * @access  Private
- */
-router.patch('/import/:jobId/draft/:rowId', gated, bankController.updateImportDraftRow);
-
-/**
- * @route   DELETE /api/bank/import/:jobId/draft/:rowId
- * @desc    Delete a draft row before import
- * @access  Private
- */
-router.delete('/import/:jobId/draft/:rowId', gated, bankController.deleteImportDraftRow);
-
-/**
- * @route   POST /api/bank/import/:jobId/confirm
- * @desc    Confirm a draft and start final import
- * @access  Private
- */
-router.post('/import/:jobId/confirm', gated, bankController.confirmImportDraft);
-
-/**
- * @route   GET /api/bank/imports
- * @desc    Get import history
- * @access  Private
- * @query   { page: number, limit: number }
- */
-router.get('/imports', gated, bankController.getImportHistory);
-
-/**
- * @route   POST /api/bank/import/:jobId/undo
- * @desc    Undo import (delete imported transactions)
- * @access  Private
- */
-router.post('/import/:jobId/undo', gated, bankController.undoImport);
 
 // ============================================
 // WEBHOOK ROUTES (No JWT, uses signature)
