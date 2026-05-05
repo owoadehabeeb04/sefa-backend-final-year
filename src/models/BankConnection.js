@@ -1,5 +1,10 @@
 const mongoose = require('mongoose');
 const { encrypt, decrypt } = require('../utils/encryption');
+const {
+  READ_ONLY_ACCESS_MODE,
+  ALLOWED_OPERATIONS,
+  FORBIDDEN_OPERATIONS,
+} = require('../services/bankReadOnly.service');
 
 const bankConnectionSchema = new mongoose.Schema({
   userId: {
@@ -48,6 +53,23 @@ const bankConnectionSchema = new mongoose.Schema({
   balance: {
     type: Number,
     default: 0
+  },
+  accessMode: {
+    type: String,
+    enum: [READ_ONLY_ACCESS_MODE],
+    default: READ_ONLY_ACCESS_MODE,
+  },
+  allowedOperations: {
+    type: [String],
+    default: () => [...ALLOWED_OPERATIONS],
+  },
+  forbiddenOperations: {
+    type: [String],
+    default: () => [...FORBIDDEN_OPERATIONS],
+  },
+  securityVerifiedAt: {
+    type: Date,
+    default: Date.now,
   },
 
   // Sync management (encrypted tokens)

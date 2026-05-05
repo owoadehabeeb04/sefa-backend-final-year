@@ -6,15 +6,32 @@ const Income = require('../models/Income');
 
 const monoService = require('../services/mono.service');
 const syncScheduler = require('../services/syncScheduler.service');
+const {
+  appendBankAccessAuditLog,
+  getRecentBankAccessAuditEvents,
+  validateBankAccessAuditChain,
+} = require('../services/bankAccessAudit.service');
+const {
+  applyReadOnlyContract,
+  buildConnectionSecuritySummary,
+  normalizeReadOnlyConnection,
+} = require('../services/bankReadOnly.service');
+
+const toClientConnection = (connection) => normalizeReadOnlyConnection(connection);
 
 /**
  * Connect bank account via Mono
  * POST /api/bank/connect
  */
 const connectBankAccount = async (req, res) => {
+  const userId = req.user.userId;
+  const requestMeta = {
+    ipAddress: req.ip,
+    userAgent: req.get('user-agent'),
+  };
+
   try {
     const { code } = req.body;
-    const userId = req.user.userId;
 
     if (!code) {
       return res.status(400).json({
@@ -22,6 +39,16 @@ const connectBankAccount = async (req, res) => {
         message: 'Authorization code is required',
       });
     }
+
+    await appendBankAccessAuditLog({
+      userId,
+      eventType: 'connect_requested',
+      actorType: 'user',
+      requestMeta,
+      metadata: {
+        source: 'mono',
+      },
+    });
 
     const accountId = await monoService.exchangeToken(code);
     const accountDetails = await monoService.getAccountDetails(accountId);
@@ -53,16 +80,28 @@ const connectBankAccount = async (req, res) => {
       accessToken: accountId,
       syncStatus: 'queued',
     });
+    applyReadOnlyContract(connection, { touchSecurityVerifiedAt: true });
+    await connection.save();
+
+    await appendBankAccessAuditLog({
+      userId,
+      connectionId: connection._id,
+      eventType: 'connect_completed',
+      actorType: 'user',
+      requestMeta,
+      metadata: {
+        provider: connection.provider,
+        institutionName: connection.institutionName,
+        accountId: connection.accountId,
+      },
+    });
 
     const queuedSync = await syncScheduler.queueConnectionSync(connection, userId, {
       isInitialSync: true,
       syncType: 'initial_connect',
       triggeredBy: 'user',
       forceSync: true,
-      requestMeta: {
-        ipAddress: req.ip,
-        userAgent: req.get('user-agent'),
-      },
+      requestMeta,
     });
 
     connection.currentSyncLogId = queuedSync.syncLogId;
@@ -72,22 +111,24 @@ const connectBankAccount = async (req, res) => {
     return res.status(201).json({
       success: true,
       message: 'Bank account connected and initial sync queued',
-      data: {
-        _id: connection._id,
+      data: toClientConnection({
+        ...connection.toObject({ virtuals: true }),
         connectionId: connection._id,
-        institutionName: connection.institutionName,
-        accountName: connection.accountName,
-        accountNumber: connection.accountNumber,
-        syncStatus: connection.syncStatus,
         currentSyncLogId: queuedSync.syncLogId,
         initialSyncLogId: queuedSync.syncLogId,
-        lastSuccessfulSyncAt: connection.lastSuccessfulSyncAt,
-        pendingResync: connection.pendingResync,
-        lastSyncErrorSummary: connection.lastSyncErrorSummary,
-      },
+      }),
     });
   } catch (error) {
     console.error('❌ Connect bank account error:', error);
+    await appendBankAccessAuditLog({
+      userId,
+      eventType: 'connect_failed',
+      actorType: 'user',
+      requestMeta,
+      metadata: {
+        error: error.message,
+      },
+    }).catch(() => undefined);
     return res.status(500).json({
       success: false,
       message: 'Failed to connect bank account',
@@ -139,6 +180,7 @@ const getBankConnections = async (req, res) => {
             connection.balance = details.account.balance;
           }
 
+          applyReadOnlyContract(connection, { touchSecurityVerifiedAt: true });
           await connection.save();
         } catch (refreshError) {
           console.warn(
@@ -151,7 +193,7 @@ const getBankConnections = async (req, res) => {
 
     return res.json({
       success: true,
-      data: connections,
+      data: connections.map(toClientConnection),
       count: connections.length,
     });
   } catch (error) {
@@ -195,13 +237,66 @@ const getBankConnection = async (req, res) => {
 
     return res.json({
       success: true,
-      data: connection,
+      data: toClientConnection(connection),
     });
   } catch (error) {
     console.error('❌ Get connection error:', error);
     return res.status(500).json({
       success: false,
       message: 'Failed to fetch bank connection',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Get bank connection security summary
+ * GET /api/bank/connections/:id/security
+ */
+const getBankConnectionSecurity = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+
+    const connection = await BankConnection.findOne({
+      _id: id,
+      userId,
+      isActive: true,
+    }).select('-authCode -accessToken');
+
+    if (!connection) {
+      return res.status(404).json({
+        success: false,
+        message: 'Bank connection not found',
+      });
+    }
+
+    const [recentEvents, auditValidation] = await Promise.all([
+      getRecentBankAccessAuditEvents({
+        userId,
+        connectionId: connection._id,
+        limit: 8,
+      }),
+      validateBankAccessAuditChain({
+        userId,
+        connectionId: connection._id,
+      }),
+    ]);
+
+    return res.json({
+      success: true,
+      data: buildConnectionSecuritySummary(connection, {
+        recentEvents,
+        chainValid: auditValidation.valid,
+        checkedEntries: auditValidation.checkedEntries,
+        checkedAt: auditValidation.checkedAt,
+      }),
+    });
+  } catch (error) {
+    console.error('❌ Get connection security error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to fetch bank connection security details',
       error: error.message,
     });
   }
@@ -265,10 +360,14 @@ const syncBankTransactions = async (req, res) => {
  * DELETE /api/bank/connections/:id
  */
 const disconnectBankAccount = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const userId = req.user.userId;
+  const { id } = req.params;
+  const userId = req.user.userId;
+  const requestMeta = {
+    ipAddress: req.ip,
+    userAgent: req.get('user-agent'),
+  };
 
+  try {
     const connection = await BankConnection.findOne({
       _id: id,
       userId,
@@ -281,6 +380,17 @@ const disconnectBankAccount = async (req, res) => {
         message: 'Bank connection not found',
       });
     }
+
+    await appendBankAccessAuditLog({
+      userId,
+      connectionId: connection._id,
+      eventType: 'disconnect_requested',
+      actorType: 'user',
+      requestMeta,
+      metadata: {
+        institutionName: connection.institutionName,
+      },
+    });
 
     try {
       await monoService.unlinkAccount(connection.accountId);
@@ -344,6 +454,18 @@ const disconnectBankAccount = async (req, res) => {
     connection.pendingResync = false;
     await connection.save();
 
+    await appendBankAccessAuditLog({
+      userId,
+      connectionId: connection._id,
+      eventType: 'disconnect_completed',
+      actorType: 'user',
+      requestMeta,
+      metadata: {
+        institutionName: connection.institutionName,
+        totalDeleted: expenseIds.length + incomeIds.length,
+      },
+    });
+
     return res.json({
       success: true,
       message: 'Bank account disconnected and synced transactions removed successfully',
@@ -355,6 +477,18 @@ const disconnectBankAccount = async (req, res) => {
     });
   } catch (error) {
     console.error('❌ Disconnect bank account error:', error);
+    if (id) {
+      await appendBankAccessAuditLog({
+        userId,
+        connectionId: id,
+        eventType: 'disconnect_failed',
+        actorType: 'user',
+        requestMeta,
+        metadata: {
+          error: error.message,
+        },
+      }).catch(() => undefined);
+    }
     return res.status(500).json({
       success: false,
       message: 'Failed to disconnect bank account',
@@ -399,6 +533,15 @@ const handleMonoWebhook = async (req, res) => {
       case 'reauthorization_required':
         connection.syncStatus = 'reauth_required';
         await connection.save();
+        await appendBankAccessAuditLog({
+          userId: connection.userId,
+          connectionId: connection._id,
+          eventType: 'reauthorization_required',
+          actorType: 'webhook',
+          metadata: {
+            provider: connection.provider,
+          },
+        });
         break;
 
       case 'account_updated': {
@@ -417,7 +560,17 @@ const handleMonoWebhook = async (req, res) => {
           connection.balance = details.account.balance;
         }
 
+        applyReadOnlyContract(connection, { touchSecurityVerifiedAt: true });
         await connection.save();
+        await appendBankAccessAuditLog({
+          userId: connection.userId,
+          connectionId: connection._id,
+          eventType: 'account_updated',
+          actorType: 'webhook',
+          metadata: {
+            institutionName: connection.institutionName,
+          },
+        });
         break;
       }
 
@@ -442,6 +595,7 @@ module.exports = {
   connectBankAccount,
   getBankConnections,
   getBankConnection,
+  getBankConnectionSecurity,
   syncBankTransactions,
   disconnectBankAccount,
   handleMonoWebhook,

@@ -7,6 +7,7 @@ const {
   requireVerifiedEmail,
   requireOnboardingComplete,
 } = require('../middleware/auth.middleware');
+const { rejectMoneyMovementRouteIntent } = require('../middleware/bankReadOnly.middleware');
 const { 
   verifyMonoWebhook, 
   logWebhookEvent, 
@@ -19,6 +20,8 @@ const gated = [authenticate, requireVerifiedEmail, requireOnboardingComplete];
  * Bank Connection Routes
  * Base path: /api/bank
  */
+
+router.use(rejectMoneyMovementRouteIntent);
 
 // ============================================
 // AUTHENTICATED ROUTES (Require JWT)
@@ -45,6 +48,13 @@ router.get('/connections', gated, bankController.getBankConnections);
  * @access  Private
  */
 router.get('/connections/:id', gated, bankController.getBankConnection);
+
+/**
+ * @route   GET /api/bank/connections/:id/security
+ * @desc    Get read-only security details for a bank connection
+ * @access  Private
+ */
+router.get('/connections/:id/security', gated, bankController.getBankConnectionSecurity);
 
 /**
  * @route   POST /api/bank/connections/:id/sync

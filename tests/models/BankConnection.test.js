@@ -30,6 +30,10 @@ describe('BankConnection Model', () => {
       expect(savedConnection.isActive).toBe(true);
       expect(savedConnection.autoSync).toBe(true);
       expect(savedConnection.syncStatus).toBe('active');
+      expect(savedConnection.accessMode).toBe('read_only');
+      expect(savedConnection.allowedOperations).toContain('read_transactions');
+      expect(savedConnection.forbiddenOperations).toContain('transfer');
+      expect(savedConnection.securityVerifiedAt).toBeDefined();
     });
 
     it('should require userId', async () => {

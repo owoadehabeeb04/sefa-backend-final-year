@@ -1,4 +1,5 @@
 const axios = require('axios');
+const { assertReadOnlyBankOperation } = require('./bankReadOnly.service');
 
 /**
  * Mono API Service
@@ -197,6 +198,7 @@ monoClient.interceptors.response.use(
  */
 const exchangeToken = async (code) => {
   try {
+    assertReadOnlyBankOperation('connect_account');
     const response = await monoClient.post('/v2/accounts/auth', { code });
     const accountId = extractAccountIdFromAuthResponse(response.data);
     if (accountId) return accountId;
@@ -236,6 +238,7 @@ const exchangeToken = async (code) => {
  */
 const getAccountDetails = async (accountId) => {
   try {
+    assertReadOnlyBankOperation('read_account_details');
     if (!accountId) {
       throw new Error('Missing Mono account ID from token exchange');
     }
@@ -265,6 +268,7 @@ const getAccountDetails = async (accountId) => {
  */
 const getAccountIdentity = async (accountId) => {
   try {
+    assertReadOnlyBankOperation('read_account_details');
     const response = await monoClient.get(`/accounts/${accountId}/identity`);
     return response.data;
   } catch (error) {
@@ -282,6 +286,7 @@ const getAccountIdentity = async (accountId) => {
  */
 const getAccountStatement = async (accountId, options = {}) => {
   try {
+    assertReadOnlyBankOperation('read_transactions');
     const { period = 'last3months', output = 'json' } = options;
     
     const response = await monoClient.get(`/accounts/${accountId}/statement`, {
@@ -306,6 +311,7 @@ const getAccountStatement = async (accountId, options = {}) => {
  */
 const fetchTransactions = async (accountId, options = {}) => {
   try {
+    assertReadOnlyBankOperation('read_transactions');
     const { start, end, paginate, limit = 100 } = options;
     
     const params = {
@@ -414,6 +420,7 @@ const fetchAllTransactions = async (accountId, options = {}) => {
  */
 const getAccountIncome = async (accountId) => {
   try {
+    assertReadOnlyBankOperation('read_account_details');
     const response = await monoClient.get(`/accounts/${accountId}/income`);
     return response.data;
   } catch (error) {
@@ -428,6 +435,7 @@ const getAccountIncome = async (accountId) => {
  */
 const reauthorizeAccount = async (accountId) => {
   try {
+    assertReadOnlyBankOperation('reauthorize_notice');
     const response = await monoClient.post(`/accounts/${accountId}/reauthorise`);
     return response.data;
   } catch (error) {
@@ -442,6 +450,7 @@ const reauthorizeAccount = async (accountId) => {
  */
 const unlinkAccount = async (accountId) => {
   try {
+    assertReadOnlyBankOperation('disconnect');
     const response = await monoClient.post(`/accounts/${accountId}/unlink`);
     return response.data;
   } catch (error) {
@@ -456,6 +465,7 @@ const unlinkAccount = async (accountId) => {
  */
 const syncAccount = async (accountId) => {
   try {
+    assertReadOnlyBankOperation('read_transactions');
     const response = await monoClient.post(`/accounts/${accountId}/sync`);
     return response.data;
   } catch (error) {
@@ -469,6 +479,7 @@ const syncAccount = async (accountId) => {
  */
 const getInstitutions = async () => {
   try {
+    assertReadOnlyBankOperation('read_account_details');
     const response = await monoClient.get('/coverage');
     return response.data.institutions || [];
   } catch (error) {

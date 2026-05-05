@@ -15,6 +15,7 @@ jest.mock('../../src/services/mono.service', () => ({
 const mongoose = require('mongoose');
 const BankConnection = require('../../src/models/BankConnection');
 const Expense = require('../../src/models/Expense');
+const BankAccessAuditLog = require('../../src/models/BankAccessAuditLog');
 const ImportedTransactionMap = require('../../src/models/ImportedTransactionMap');
 const Income = require('../../src/models/Income');
 const monoService = require('../../src/services/mono.service');
@@ -152,5 +153,9 @@ describe('syncScheduler.service', () => {
     expect(secondRun.importedCount).toBe(0);
     expect(secondRun.duplicateCount).toBe(2);
     expect(await SyncLog.countDocuments({ connectionId: connection._id })).toBe(2);
+    const auditEvents = await BankAccessAuditLog.find({ connectionId: connection._id }).sort({ chainIndex: 1 });
+    expect(auditEvents.map((event) => event.eventType)).toEqual(
+      expect.arrayContaining(['sync_queued', 'sync_started', 'sync_completed'])
+    );
   });
 });

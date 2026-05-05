@@ -11,6 +11,8 @@ const deduplicationService = require('./deduplication.service');
 const transferDetectionService = require('./transfer.service');
 const aiCategorizationService = require('./aiCategorization.service');
 const AppError = require('../utils/AppError');
+const { appendBankAccessAuditLog } = require('./bankAccessAudit.service');
+const { applyReadOnlyContract } = require('./bankReadOnly.service');
 
 const ACTIVE_SYNC_STATUSES = ['queued', 'syncing', 'pending', 'processing'];
 const MAX_SYNC_ERRORS = 20;
@@ -120,9 +122,9 @@ const createSyncLog = async (connection, userId, options = {}) => {
       endDate: options.endDate || undefined,
     },
     connectionSnapshot: buildConnectionSnapshot(connection),
-    metadata: {
-      source: 'mono',
-      triggeredBy: options.triggeredBy || 'user',
+  metadata: {
+    source: 'mono',
+    triggeredBy: options.triggeredBy || 'user',
       ipAddress: options.requestMeta?.ipAddress,
       userAgent: options.requestMeta?.userAgent,
     },
@@ -348,6 +350,12 @@ const buildMappingPayload = (base, transaction, savedTransaction) => ({
   },
 });
 
+const toActorType = (triggeredBy) => {
+  if (triggeredBy === 'webhook') return 'webhook';
+  if (triggeredBy === 'user') return 'user';
+  return 'system';
+};
+
 const persistSingleTransaction = async (transaction, context, options = {}) => {
   const transactionType = transaction.direction === 'credit' ? 'income' : 'expense';
   const category = await resolveTransactionCategory(transaction, context.userId, {
@@ -491,6 +499,19 @@ const queueConnectionSync = async (connectionOrId, userId, options = {}) => {
   connection.cancelRequested = false;
   await saveConnectionDocument(connection);
 
+  await appendBankAccessAuditLog({
+    userId,
+    connectionId: connection._id,
+    eventType: 'sync_queued',
+    actorType: toActorType(options.triggeredBy),
+    requestMeta: options.requestMeta || {},
+    metadata: {
+      syncType: syncLog.syncType,
+      syncLogId: syncLog._id,
+      triggeredBy: options.triggeredBy || 'user',
+    },
+  });
+
   const { addSyncJob } = require('../config/queue');
   const job = await addSyncJob(
     {
@@ -567,7 +588,23 @@ const runQueuedSync = async (job) => {
   connection.currentSyncLogId = syncLog._id;
   connection.cancelRequested = false;
   connection.lastSyncAttemptAt = syncLog.startedAt;
+  applyReadOnlyContract(connection, { touchSecurityVerifiedAt: true });
   await connection.save();
+
+  await appendBankAccessAuditLog({
+    userId,
+    connectionId: connection._id,
+    eventType: 'sync_started',
+    actorType: toActorType(syncLog.metadata?.triggeredBy),
+    requestMeta: {
+      ipAddress: syncLog.metadata?.ipAddress,
+      userAgent: syncLog.metadata?.userAgent,
+    },
+    metadata: {
+      syncType: syncLog.syncType,
+      syncLogId: syncLog._id,
+    },
+  });
 
   const result = {
     totalFetched: 0,
@@ -701,6 +738,26 @@ const runQueuedSync = async (job) => {
 
     await connection.save();
 
+    await appendBankAccessAuditLog({
+      userId,
+      connectionId: connection._id,
+      eventType: terminalStatus === 'cancelled' ? 'sync_cancelled' : terminalStatus === 'failed' ? 'sync_failed' : 'sync_completed',
+      actorType: toActorType(syncLog.metadata?.triggeredBy),
+      requestMeta: {
+        ipAddress: syncLog.metadata?.ipAddress,
+        userAgent: syncLog.metadata?.userAgent,
+      },
+      metadata: {
+        syncType: syncLog.syncType,
+        syncLogId: syncLog._id,
+        importedCount: result.importedCount,
+        duplicateCount: result.duplicateCount,
+        failedCount: result.failedCount,
+        skippedCount: result.skippedCount,
+        status: terminalStatus,
+      },
+    });
+
     if (result.importedCount > 0) {
       const { addNotificationJob } = require('../config/queue');
       await addNotificationJob({
@@ -762,7 +819,26 @@ const runQueuedSync = async (job) => {
     connection.cancelRequested = false;
     connection.lastSyncAt = new Date();
     connection.nextSyncAt = connection.autoSync ? calculateNextSync(connection.syncInterval) : null;
+    applyReadOnlyContract(connection, { touchSecurityVerifiedAt: true });
     await connection.save();
+
+    await appendBankAccessAuditLog({
+      userId,
+      connectionId: connection._id,
+      eventType: isCancelled ? 'sync_cancelled' : 'sync_failed',
+      actorType: toActorType(syncLog.metadata?.triggeredBy),
+      requestMeta: {
+        ipAddress: syncLog.metadata?.ipAddress,
+        userAgent: syncLog.metadata?.userAgent,
+      },
+      metadata: {
+        syncType: syncLog.syncType,
+        syncLogId: syncLog._id,
+        error: error.message,
+        importedCount: result.importedCount,
+        duplicateCount: result.duplicateCount,
+      },
+    });
 
     if (isCancelled) {
       return {
