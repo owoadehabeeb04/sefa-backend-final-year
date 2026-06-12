@@ -12,6 +12,7 @@ const { initializeProcessors, closeQueues } = require('./config/queue');
 const schedulerService = require('./services/scheduler.service');
 const { startSyncCronJobs, stopSyncCronJobs } = require('./jobs/syncCronJobs');
 const { assertBrevoConfigured } = require('./services/otpService');
+const { attachAssistantSocketServer } = require('./realtime/assistantSocketServer');
 
 const app = express();
 
@@ -161,6 +162,7 @@ const bootstrap = async () => {
       }
       console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
     });
+    attachAssistantSocketServer(server);
   } catch (error) {
     console.error('Failed to bootstrap server:', error);
     process.exit(1);

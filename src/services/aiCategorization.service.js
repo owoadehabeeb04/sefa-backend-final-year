@@ -1,17 +1,15 @@
-const Groq = require('groq-sdk');
 const Category = require('../models/Category');
+const { completeJson } = require('./llm/azureOpenAI.service');
+const {
+  buildBatchCategorizationPrompts,
+  buildCategorizationPrompts,
+} = require('./prompts/financePrompts');
 
-// Initialize Groq client
-const groq = process.env.GROQ_API_KEY
-  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
-  : null;
-
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 const BATCH_SIZE = 20;
 
 /**
  * AI Categorization Service
- * Uses Groq AI to automatically categorize transactions based on description and context
+ * Uses Azure OpenAI to automatically categorize transactions based on description and context
  */
 
 async function categorizeTransaction(transaction, userId) {
@@ -30,40 +28,35 @@ async function categorizeTransaction(transaction, userId) {
       ? userCategories.map(c => c.name)
       : getDefaultCategoryNames(type);
 
-    if (!groq || process.env.NODE_ENV === 'test') {
+    if (process.env.NODE_ENV === 'test') {
       return getFallbackCategory(description, type, userCategories);
     }
 
-    // Build AI prompt
-    const prompt = buildCategorizationPrompt(description, amount, type, categoryNames);
-
-    // Call Groq AI
-    const completion = await groq.chat.completions.create({
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a financial transaction categorization expert. You analyze transaction descriptions and assign them to the most appropriate category.'
-        },
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      model: GROQ_MODEL,
-      temperature: 0.3, // Low temperature for consistent categorization
-      max_tokens: 50
+    const promptConfig = buildCategorizationPrompts({
+      description,
+      amount,
+      type,
+      categoryNames,
     });
 
-    const response = completion.choices[0]?.message?.content?.trim();
+    const response = await completeJson({
+      feature: 'transaction-categorization',
+      ...promptConfig,
+      maxTokens: 120,
+      temperature: 0.1,
+    });
 
-    if (!response) {
+    const result = response?.json;
+    if (!result?.category) {
       return getFallbackCategory(description, type, userCategories);
     }
 
-    // Parse AI response
-    const category = parseCategorizationResponse(response, userCategories, type);
-
-    return category;
+    const category = parseCategorizationResponse(result.category, userCategories, type);
+    return {
+      ...category,
+      confidence: result.confidence || category.confidence,
+      reason: result.reason || null,
+    };
 
   } catch (error) {
     console.error('AI Categorization Error:', error);
@@ -115,7 +108,7 @@ async function batchCategorizeTransactions(transactions, userId) {
       };
     });
 
-    if (!groq || process.env.NODE_ENV === 'test') {
+    if (process.env.NODE_ENV === 'test') {
       results.push(...fallbackResults);
       continue;
     }
@@ -133,27 +126,15 @@ async function batchCategorizeTransactions(transactions, userId) {
         };
       });
 
-      const completion = await groq.chat.completions.create({
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a financial transaction categorization expert. Return ONLY valid JSON in the shape {"results":[{"id":"...", "category":"...", "confidence":"high|medium|low"}]}. Use only categories provided for each transaction. If unsure, pick the best available category and mark confidence as low.'
-          },
-          {
-            role: 'user',
-            content: JSON.stringify({
-              task: 'batch_categorize_transactions',
-              transactions: serializedBatch,
-            })
-          }
-        ],
-        model: GROQ_MODEL,
-        temperature: 0.2,
-        max_tokens: Math.max(300, batch.length * 40)
+      const promptConfig = buildBatchCategorizationPrompts(serializedBatch);
+      const completion = await completeJson({
+        feature: 'batch-transaction-categorization',
+        ...promptConfig,
+        maxTokens: Math.max(300, batch.length * 80),
+        temperature: 0.1,
       });
 
-      const rawResponse = completion.choices[0]?.message?.content?.trim();
-      const parsedResponse = parseBatchCategorizationResponse(rawResponse);
+      const parsedResponse = Array.isArray(completion?.json?.results) ? completion.json.results : [];
       const byId = new Map(parsedResponse.map((entry) => [String(entry.id), entry]));
 
       const batchResults = batch.map((transaction, index) => {
@@ -207,27 +188,6 @@ function parseBatchCategorizationResponse(response) {
       return [];
     }
   }
-}
-
-/**
- * Build categorization prompt for AI
- * @param {String} description - Transaction description
- * @param {Number} amount - Transaction amount
- * @param {String} type - Transaction type
- * @param {Array} categoryNames - Available category names
- * @returns {String} AI prompt
- */
-function buildCategorizationPrompt(description, amount, type, categoryNames) {
-  return `Categorize this ${type} transaction:
-
-Description: "${description}"
-Amount: ₦${amount?.toLocaleString() || 0}
-
-Available categories:
-${categoryNames.join(', ')}
-
-Based on the description, which category best fits this transaction?
-Return ONLY the exact category name from the list above, nothing else.`;
 }
 
 /**

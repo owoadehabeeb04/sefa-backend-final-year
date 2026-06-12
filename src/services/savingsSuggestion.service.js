@@ -1,21 +1,12 @@
 const Expense = require('../models/Expense');
 const Income = require('../models/Income');
 const Category = require('../models/Category');
-const Groq = require('groq-sdk');
 const mongoose = require('mongoose');
 const moment = require('moment');
+const { completeJson } = require('./llm/azureOpenAI.service');
+const { buildSavingsAdvicePrompts } = require('./prompts/financePrompts');
 
-// Initialize Groq client
-const groq = process.env.GROQ_API_KEY
-  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
-  : null;
-
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
-
-const shouldUseGroq = () =>
-  Boolean(groq)
-  && process.env.GROQ_API_KEY !== 'test-groq-key'
-  && process.env.NODE_ENV !== 'test';
+const shouldUseAzure = () => process.env.NODE_ENV !== 'test';
 
 function normalizeUserId(userId) {
   if (mongoose.Types.ObjectId.isValid(userId)) {
@@ -436,45 +427,26 @@ async function calculateTotalSavingsPotential(userId, months) {
  */
 async function generateAISavingsAdvice(opportunities, totalPotential) {
   try {
-    if (!shouldUseGroq()) {
+    if (!shouldUseAzure()) {
       return getFallbackSavingsAdvice(totalPotential);
     }
 
-    const topOpportunities = opportunities.slice(0, 3).map(opp =>
-      `${opp.category}: Save ₦${opp.potentialMonthlySavings.toLocaleString()}/month by reducing ${opp.suggestedReduction}%`
-    ).join(', ');
-
-    const prompt = `You are a Nigerian financial advisor. Help a user save money based on their spending patterns.
-
-Total Potential Savings: ₦${totalPotential.toLocaleString()}/month (₦${(totalPotential * 12).toLocaleString()}/year)
-
-Top Savings Opportunities:
-${topOpportunities || 'General spending reduction'}
-
-Provide practical, actionable advice (3-4 sentences) on:
-1. Which savings to prioritize
-2. How to implement changes gradually
-3. Motivation to stay consistent
-
-Use simple words. Be encouraging. Use Nigerian context.`;
-
-    const completion = await groq.chat.completions.create({
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a practical Nigerian financial advisor. Give clear, actionable savings advice using simple language.'
-        },
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      model: GROQ_MODEL,
-      temperature: 0.7,
-      max_tokens: 200
+    const promptConfig = buildSavingsAdvicePrompts({ opportunities, totalPotential });
+    const completion = await completeJson({
+      feature: 'savings-suggestions',
+      ...promptConfig,
+      maxTokens: 420,
+      temperature: 0.25,
     });
 
-    return completion.choices[0]?.message?.content?.trim() || getFallbackSavingsAdvice(totalPotential);
+    const parsed = completion?.json || {};
+    const advice = [
+      parsed.summary,
+      ...(Array.isArray(parsed.priorities) ? parsed.priorities.slice(0, 2) : []),
+      parsed.motivation,
+    ].filter(Boolean).join(' ');
+
+    return advice || getFallbackSavingsAdvice(totalPotential);
 
   } catch (error) {
     console.error('AI Savings Advice Error:', error);

@@ -2,21 +2,12 @@ const Expense = require('../models/Expense');
 const Income = require('../models/Income');
 const Budget = require('../models/Budget');
 const Category = require('../models/Category');
-const Groq = require('groq-sdk');
 const mongoose = require('mongoose');
 const moment = require('moment');
+const { completeJson } = require('./llm/azureOpenAI.service');
+const { buildBudgetAdvicePrompts } = require('./prompts/financePrompts');
 
-// Initialize Groq client
-const groq = process.env.GROQ_API_KEY
-  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
-  : null;
-
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
-
-const shouldUseGroq = () =>
-  Boolean(groq)
-  && process.env.GROQ_API_KEY !== 'test-groq-key'
-  && process.env.NODE_ENV !== 'test';
+const shouldUseAzure = () => process.env.NODE_ENV !== 'test';
 
 function normalizeUserId(userId) {
   if (mongoose.Types.ObjectId.isValid(userId)) {
@@ -390,48 +381,31 @@ async function generateAIBudgetAdvice(spending, income, categorySpending) {
       ? ((income.monthlyAverage - spending.monthlyAverage) / income.monthlyAverage) * 100
       : 0;
 
-    if (!shouldUseGroq()) {
+    if (!shouldUseAzure()) {
       return getFallbackBudgetAdvice(savingsRate);
     }
 
-    const topCategories = categorySpending.slice(0, 5).map(cat =>
-      `${cat.categoryName}: ₦${cat.monthlyAverage.toLocaleString()}`
-    ).join(', ');
-
-    const prompt = `You are a Nigerian financial advisor. Provide practical budget advice based on this financial data:
-
-Monthly Income: ₦${income.monthlyAverage.toLocaleString()}
-Monthly Expenses: ₦${spending.monthlyAverage.toLocaleString()}
-Savings Rate: ${Math.round(savingsRate)}%
-Spending Volatility: ${spending.volatility.toFixed(0)}% (${spending.volatility > 30 ? 'high' : 'low'})
-
-Top Spending Categories:
-${topCategories}
-
-Provide brief, actionable advice (3-4 sentences) on:
-1. Budget allocation
-2. Spending priorities
-3. Savings strategy
-
-Use simple words. Be encouraging and practical. Use Nigerian context (Naira, local expenses).`;
-
-    const completion = await groq.chat.completions.create({
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a practical Nigerian financial advisor. Give clear, actionable budget advice using simple language.'
-        },
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      model: GROQ_MODEL,
-      temperature: 0.7,
-      max_tokens: 200
+    const promptConfig = buildBudgetAdvicePrompts({
+      spendingAnalysis: spending,
+      incomeAnalysis: income,
+      categorySpending,
     });
 
-    return completion.choices[0]?.message?.content?.trim() || getFallbackBudgetAdvice(savingsRate);
+    const completion = await completeJson({
+      feature: 'budget-recommendations',
+      ...promptConfig,
+      maxTokens: 420,
+      temperature: 0.2,
+    });
+
+    const parsed = completion?.json || {};
+    const advice = [
+      parsed.summary,
+      ...(Array.isArray(parsed.focusAreas) ? parsed.focusAreas.slice(0, 2) : []),
+      ...(Array.isArray(parsed.risks) ? parsed.risks.slice(0, 1) : []),
+    ].filter(Boolean).join(' ');
+
+    return advice || getFallbackBudgetAdvice(savingsRate);
 
   } catch (error) {
     console.error('AI Budget Advice Error:', error);

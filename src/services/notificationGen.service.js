@@ -1,13 +1,10 @@
-const axios = require('axios');
+const { completeText } = require('./llm/azureOpenAI.service');
+const { buildNotificationAdvicePrompts } = require('./prompts/financePrompts');
 
 /**
- * Notification Generation Service (Groq AI)
+ * Notification Generation Service (Azure OpenAI)
  * Generates AI-powered financial advice for notifications
  */
-
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 
 /**
  * Generate AI advice for transaction alert
@@ -66,7 +63,7 @@ Rules:
 
 Provide a brief, practical financial tip (max 2 sentences) in Nigerian English. Be friendly and encouraging.`;
 
-  return await callGroqAPI(prompt, { max_tokens: 100 });
+  return await callAzureNotificationAI('transaction_alert', { prompt, transaction, context }, { maxTokens: 100 });
 };
 
 /**
@@ -106,7 +103,7 @@ Rules:
 
 Provide practical advice to help them stay within budget (max 2 sentences). Be constructive, not judgmental.`;
 
-  return await callGroqAPI(prompt, { max_tokens: 100 });
+  return await callAzureNotificationAI('budget_warning', { prompt, payload, context }, { maxTokens: 100 });
 };
 
 /**
@@ -128,7 +125,7 @@ This Week:
 
 Provide encouraging insights and actionable advice (max 3 sentences). Use Nigerian context.`;
 
-  return await callGroqAPI(prompt, { max_tokens: 150 });
+  return await callAzureNotificationAI('weekly_summary', { prompt, summary }, { maxTokens: 150 });
 };
 
 /**
@@ -149,7 +146,7 @@ Insight:
 
 Give practical, culturally relevant advice (max 2 sentences). Be motivating.`;
 
-  return await callGroqAPI(prompt, { max_tokens: 100 });
+  return await callAzureNotificationAI('spending_insight', { prompt, insight }, { maxTokens: 100 });
 };
 
 /**
@@ -192,56 +189,29 @@ const calculateRiskScore = (type, data) => {
 };
 
 /**
- * Call Groq API
+ * Call Azure OpenAI
  * @param {string} prompt - Prompt text
  * @param {Object} options - API options
  * @returns {Promise<string>} AI response
  */
-const callGroqAPI = async (prompt, options = {}) => {
-  if (!GROQ_API_KEY) {
-    console.warn('⚠️  GROQ_API_KEY not configured, using fallback advice');
-    return getFallbackAdvice();
-  }
-  
+const callAzureNotificationAI = async (purpose, payload, options = {}) => {
   try {
-    const response = await axios.post(
-      GROQ_API_URL,
-      {
-        model: GROQ_MODEL,
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a helpful Nigerian financial advisor. Provide brief, practical advice in friendly Nigerian English. Keep responses under 2-3 sentences.'
-          },
-          {
-            role: 'user',
-            content: prompt
-          }
-        ],
-        max_tokens: options.max_tokens || 100,
-        temperature: 0.7,
-        top_p: 1,
-        stream: false
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 10000 // 10 seconds
-      }
-    );
-    
-    const advice = response.data.choices[0]?.message?.content?.trim();
-    
+    const promptConfig = buildNotificationAdvicePrompts({ purpose, payload });
+    const response = await completeText({
+      feature: `notification-${purpose}`,
+      ...promptConfig,
+      maxTokens: options.maxTokens || 100,
+      temperature: 0.45,
+    });
+
+    const advice = response?.text?.trim();
     if (!advice) {
-      throw new Error('Empty response from Groq API');
+      throw new Error('Empty response from Azure OpenAI');
     }
-    
+
     return advice;
-    
   } catch (error) {
-    console.error('❌ Groq API error:', error.message);
+    console.error('❌ Azure OpenAI notification error:', error.message);
     return getFallbackAdvice();
   }
 };

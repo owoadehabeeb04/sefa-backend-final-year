@@ -15,6 +15,8 @@ const syncRoutes = require('./sync.routes');
 const insightsRoutes = require('./insights.routes');
 const bankRoutes = require('./bankRoutes');
 const notificationRoutes = require('./notification.routes');
+const statementImportRoutes = require('./statementImportRoutes');
+const assistantRoutes = require('./assistantRoutes');
 
 // Mount routes
 router.use('/auth', authRoutes);
@@ -30,6 +32,8 @@ router.use('/sync', syncRoutes);
 router.use('/insights', insightsRoutes);
 router.use('/bank', bankRoutes);
 router.use('/notifications', notificationRoutes);
+router.use('/statement-imports', statementImportRoutes);
+router.use('/assistant', assistantRoutes);
 
 // Health check
 router.get('/health', (req, res) => {
@@ -41,4 +45,3 @@ router.get('/health', (req, res) => {
 });
 
 module.exports = router;
-

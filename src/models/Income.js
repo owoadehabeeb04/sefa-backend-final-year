@@ -1,5 +1,14 @@
 const mongoose = require('mongoose');
 
+const normalizeExternalId = (value) => {
+  if (value == null) {
+    return undefined;
+  }
+
+  const normalized = String(value).trim();
+  return normalized || undefined;
+};
+
 const incomeSchema = new mongoose.Schema({
   userId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -70,6 +79,10 @@ const incomeSchema = new mongoose.Schema({
     default: false,
     index: true
   },
+  statementTimeProvided: {
+    type: Boolean,
+    default: false
+  },
   importJobId: {
     type: mongoose.Schema.Types.ObjectId,
     default: null,
@@ -78,7 +91,7 @@ const incomeSchema = new mongoose.Schema({
   externalId: {
     type: String,
     trim: true,
-    sparse: true // Bank's transaction ID
+    set: normalizeExternalId
   },
   isTransfer: {
     type: Boolean,
@@ -101,7 +114,15 @@ incomeSchema.index({ userId: 1, date: -1, createdAt: -1 }); // Cursor keyset pag
 incomeSchema.index({ userId: 1, categoryId: 1, date: -1 });
 incomeSchema.index({ userId: 1, createdAt: -1 });
 incomeSchema.index({ userId: 1, synced: 1 }); // For offline sync
-incomeSchema.index({ userId: 1, externalId: 1 }, { unique: true, sparse: true }); // For duplicate detection
+incomeSchema.index(
+  { userId: 1, externalId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      externalId: { $type: 'string' }
+    }
+  }
+); // For duplicate detection on imported transactions only
 incomeSchema.index({ userId: 1, isImported: 1, importJobId: 1 }); // For import queries
 incomeSchema.index({ userId: 1, isTransfer: 1 }); // For excluding transfers from analytics
 

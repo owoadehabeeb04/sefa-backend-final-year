@@ -6,7 +6,14 @@ let mongoServer;
 process.env.NODE_ENV = 'test';
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret';
 process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
-process.env.GROQ_API_KEY = process.env.GROQ_API_KEY || 'test-groq-key';
+process.env.AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || 'https://example-resource.openai.azure.com';
+process.env.AZURE_OPENAI_API_KEY = process.env.AZURE_OPENAI_API_KEY || 'test-azure-openai-key';
+process.env.AZURE_OPENAI_DEPLOYMENT_NAME = process.env.AZURE_OPENAI_DEPLOYMENT_NAME || 'test-deployment';
+process.env.AZURE_OPENAI_MODEL_NAME = process.env.AZURE_OPENAI_MODEL_NAME || 'gpt-test';
+process.env.AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '2024-10-21';
+process.env.AZURE_OPENAI_MAX_TOKENS = process.env.AZURE_OPENAI_MAX_TOKENS || '800';
+process.env.TAVILY_API_KEY = process.env.TAVILY_API_KEY || 'test-tavily-key';
+process.env.SERPAPI_API_KEY = process.env.SERPAPI_API_KEY || 'test-serpapi-key';
 
 // Setup: Connect to in-memory MongoDB before all tests
 beforeAll(async () => {

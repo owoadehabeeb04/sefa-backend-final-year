@@ -1,12 +1,16 @@
-const Groq = require('groq-sdk');
-
-// Initialize Groq client
-const groq = process.env.GROQ_API_KEY
-  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
-  : null;
+const {
+  completeJson,
+  completeText,
+  isConfigured: isAzureOpenAIConfigured,
+} = require('./llm/azureOpenAI.service');
+const {
+  buildDetailedInsightPrompts,
+  buildShortInsightPrompts,
+  buildStatementStructurePrompts,
+} = require('./prompts/financePrompts');
 
 /**
- * Generate a financial insight using Groq AI
+ * Generate a financial insight using Azure OpenAI
  * @param {Object} userData - User's financial data
  * @param {Number} userData.totalIncome - Total income for the period
  * @param {Number} userData.totalExpenses - Total expenses for the period
@@ -19,7 +23,7 @@ const groq = process.env.GROQ_API_KEY
  */
 async function generateFinancialInsight(userData) {
   try {
-    if (!groq || process.env.NODE_ENV === 'test') {
+    if (process.env.NODE_ENV === 'test') {
       return getFallbackInsight(userData);
     }
 
@@ -51,55 +55,28 @@ async function generateFinancialInsight(userData) {
       .map(cat => `${cat.name}: ₦${cat.total.toLocaleString()}`)
       .join(', ');
 
-    // Build context-aware prompt
-    const prompt = `You are a friendly financial advisor. Give ONE short tip in 15 words or less. Use SIMPLE words only — no big grammar. The people using this app are ordinary people, not experts. Write like you're chatting with a friend.
-
-Financial Summary for ${period}:
-- Income: ₦${totalIncome.toLocaleString()}
-- Expenses: ₦${totalExpenses.toLocaleString()}
-- Balance: ₦${balance.toLocaleString()}
-- Spending Rate: ${spendingRate}% of income
-- Top Spending: ${categorySummary || 'None yet'}
-- Expense Change from Last Period: ${expenseChange > 0 ? '+' : ''}${expenseChange}%
-- Income Change from Last Period: ${incomeChange > 0 ? '+' : ''}${incomeChange}%
-
-Rules:
-1. Use only simple, everyday words. No difficult or formal language.
-2. Be encouraging and positive, never judgmental
-3. Use ONLY ONE emoji maximum (at the end)
-4. Must be 15 words or less
-5. If spending is high, say it in simple terms and give one easy tip
-6. If no transactions exist, tell them to start adding their money in and out
-
-Good examples (simple language):
-- "You're within budget this week 👍"
-- "Transport cost went up — try carpooling?"
-- "You saved more than last month. Well done 🎉"
-- "You spent a lot on food — try cooking at home more"
-- "You can save ₦25,000 this month if you keep this up 💪"
-- "Start adding your income and expenses to see where money goes"
-
-Provide ONLY the insight, nothing else:`;
-
-    const completion = await groq.chat.completions.create({
-      messages: [
-        {
-          role: 'system',
-          content: 'You give very short financial tips. Use only simple words. No big grammar or hard words. Write for ordinary people.'
-        },
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      model: 'llama-3.3-70b-versatile', // Groq's best model
-      temperature: 0.7,
-      max_tokens: 50,
-      top_p: 1,
-      stream: false
+    const promptConfig = buildShortInsightPrompts({
+      totalIncome,
+      totalExpenses,
+      balance,
+      topCategories,
+      lastPeriodExpenses,
+      lastPeriodIncome,
+      period,
+      spendingRate,
+      categorySummary,
+      expenseChange,
+      incomeChange,
     });
 
-    const insight = completion.choices[0]?.message?.content?.trim();
+    const completion = await completeText({
+      feature: 'dashboard-short-insight',
+      ...promptConfig,
+      maxTokens: 80,
+      temperature: 0.5,
+    });
+
+    const insight = completion?.text?.trim();
 
     // Fallback insights if AI fails or returns empty
     if (!insight) {
@@ -134,7 +111,7 @@ Provide ONLY the insight, nothing else:`;
  */
 async function generateDetailedFinancialInsight(userData) {
   try {
-    if (!groq || process.env.NODE_ENV === 'test') {
+    if (process.env.NODE_ENV === 'test') {
       return getDetailedFallbackInsight(userData);
     }
 
@@ -152,70 +129,68 @@ async function generateDetailedFinancialInsight(userData) {
       lastPeriodExpenses = 0
     } = userData;
 
-    const currency = '₦';
-    const spendingRate = totalIncome > 0 ? ((totalExpenses / totalIncome) * 100).toFixed(0) : 0;
-    const categoryLines = topCategories.slice(0, 5).map(c => `${c.name}: ${currency}${(c.total || 0).toLocaleString()} (${(c.percentage || 0)}%)`).join('\n');
-    const dailyLines = dailySpending.length
-      ? dailySpending
-          .sort((a, b) => (b.total || 0) - (a.total || 0))
-          .slice(0, 5)
-          .map(d => `${d.date}: ${currency}${(d.total || 0).toLocaleString()}`)
-          .join('\n')
-      : 'No daily breakdown yet.';
-
-    // Compare spending to the PERIOD budget (scaled), not monthly — so the AI says "budget for this period" correctly
-    const limitForPeriod = periodBudgetLimit != null && periodBudgetLimit > 0 ? periodBudgetLimit : monthlyBudgetLimit;
-    const budgetContext = limitForPeriod != null && limitForPeriod > 0
-      ? `Budget for THIS period: ${currency}${Number(limitForPeriod).toLocaleString()}${!isCurrentMonth && monthlyBudgetLimit != null ? ` (from your ${currency}${Number(monthlyBudgetLimit).toLocaleString()}/month)` : ''}. Spent in this period: ${currency}${totalExpenses.toLocaleString()}. ${totalExpenses > limitForPeriod ? 'Over budget for this period.' : 'Within budget for this period.'}`
-      : 'No budget set.';
-
-    const prompt = `You are a friendly finance coach. Write a short review in 3-4 paragraphs. Use SIMPLE words only — no big grammar. The people using this app are ordinary people, not experts. Write like you're talking to a friend. No difficult words, no formal language.
-
-Financial data for ${period}:
-- Income: ${currency}${totalIncome.toLocaleString()}
-- Expenses: ${currency}${totalExpenses.toLocaleString()}
-- Balance: ${currency}${balance.toLocaleString()}
-- Spending rate: ${spendingRate}% of income
-- ${budgetContext}
-
-Top spending categories:
-${categoryLines || 'None yet'}
-
-Heaviest spending days (date and total):
-${dailyLines}
-
-Previous period expenses: ${currency}${lastPeriodExpenses.toLocaleString()}.
-${isCurrentMonth ? '\nIMPORTANT: This period is the CURRENT month (still ongoing). Use PRESENT tense only: say "you are having", "you\'re on track", "you\'re spending" — do NOT use past tense like "you had" or "you spent".' : ''}
-
-Structure your response (use simple words only):
-1) First paragraph: In one or two short sentences, say how they did (e.g. you did well, you're over budget, you saved well). Be kind and honest. ${isCurrentMonth ? 'Use present tense: "you are having a tough month" not "you had a tough month".' : ''}
-2) Second paragraph: If some days had high spending, say which days and give one simple tip (e.g. "You spent a lot on Jan 15 and Jan 22. Try to spread big spends across more days."). If not, say something short about where they spent most.
-3) Third paragraph: If they have a budget, compare spending to the BUDGET FOR THIS PERIOD (not monthly). Say clearly: on track, almost at limit, or over for this period, and by how much. If no budget, tell them to set one in Settings.
-4) Then give 2 to 4 action items as a BULLET LIST. Use a dash (-) or bullet (•) before each item. Keep each item one short line. Examples:
-   - Eat out less next week.
-   - Set a limit for transport.
-   - Check your subscriptions.
-
-Use Nigerian Naira (₦). Use a mix of short paragraphs and a bullet list for the action items. Simple words only. No markdown except the bullet list.`;
-
-    const completion = await groq.chat.completions.create({
-      messages: [
-        { role: 'system', content: 'You are a helpful finance coach. Use only simple, everyday words. No big grammar or hard words. Write for ordinary people. Use short paragraphs and a bullet list (with - or •) for action items.' },
-        { role: 'user', content: prompt }
-      ],
-      model: 'llama-3.3-70b-versatile',
-      temperature: 0.6,
-      max_tokens: 500,
-      top_p: 1,
-      stream: false
+    const promptConfig = buildDetailedInsightPrompts({
+      totalIncome,
+      totalExpenses,
+      balance,
+      monthlyBudgetLimit,
+      periodBudgetLimit,
+      isCurrentMonth,
+      topCategories,
+      dailySpending,
+      period,
+      lastPeriodExpenses,
     });
 
-    const text = completion.choices[0]?.message?.content?.trim();
+    const completion = await completeText({
+      feature: 'dashboard-detailed-insight',
+      ...promptConfig,
+      maxTokens: 700,
+      temperature: 0.45,
+    });
+
+    const text = completion?.text?.trim();
     if (text) return text;
     return getDetailedFallbackInsight(userData);
   } catch (error) {
     console.error('AI detailed insight error:', error);
     return getDetailedFallbackInsight(userData);
+  }
+}
+
+const safeJsonParse = (value) => {
+  try {
+    return JSON.parse(value);
+  } catch (_error) {
+    const match = String(value || '').match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]);
+    } catch (_innerError) {
+      return null;
+    }
+  }
+};
+
+async function detectStatementStructureWithAI({ text = '', tableRows = null, fileType = null } = {}) {
+  try {
+    if (process.env.NODE_ENV === 'test') {
+      return null;
+    }
+
+    const promptConfig = buildStatementStructurePrompts({ text, tableRows, fileType });
+    const completion = await completeJson({
+      feature: 'statement-structure-detection',
+      ...promptConfig,
+      maxTokens: 1800,
+      temperature: 0.1,
+    });
+
+    if (!completion?.text) return null;
+    return completion.json || safeJsonParse(completion.text);
+  } catch (error) {
+    console.error('AI statement structure detection error:', error);
+    return null;
   }
 }
 
@@ -307,14 +282,15 @@ function getFallbackInsight(userData) {
 }
 
 /**
- * Validate Groq API key
- * @returns {Boolean} True if API key is configured
+ * Validate Azure OpenAI config
+ * @returns {Boolean} True if provider is configured
  */
 function isConfigured() {
-  return !!process.env.GROQ_API_KEY;
+  return isAzureOpenAIConfigured();
 }
 
 module.exports = {
+  detectStatementStructureWithAI,
   generateFinancialInsight,
   generateDetailedFinancialInsight,
   getFallbackInsight,

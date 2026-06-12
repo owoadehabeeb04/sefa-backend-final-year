@@ -51,7 +51,21 @@ src/
 
 ## 🔧 Environment Variables
 
-See `.env.example` for all required environment variables.
+Copy `.env.example` to `.env` and set the required values.
+
+For the internet-aware assistant, the new required search keys are:
+
+- `TAVILY_API_KEY` for general live web search
+- `SERPAPI_API_KEY` for shopping and price lookup
+
+The assistant still requires the existing Azure OpenAI variables:
+
+- `AZURE_OPENAI_ENDPOINT`
+- `AZURE_OPENAI_API_KEY`
+- `AZURE_OPENAI_DEPLOYMENT_NAME`
+- `AZURE_OPENAI_MODEL_NAME`
+- `AZURE_OPENAI_API_VERSION`
+- `AZURE_OPENAI_MAX_TOKENS`
 
 ## 📚 API Documentation
 
@@ -68,5 +82,4 @@ http://localhost:3000/api-docs
 ## 📝 License
 
 ISC
-
 
