@@ -64,20 +64,30 @@ const emitProgress = async (statementImport, step, meta = null) => {
     label = `Reading page ${meta.pageNumber}`;
   }
 
-  try {
-    const entry = { step, label, percent: config.percent, meta: meta || null, at: new Date() };
-    statementImport.progress = [...(statementImport.progress || []), entry].slice(-40);
-    statementImport.progressStep = step;
-    statementImport.progressPercent = config.percent;
-    if (meta && Number.isFinite(Number(meta.pageCount))) statementImport.pageCount = Number(meta.pageCount);
-    if (meta && Number.isFinite(Number(meta.processedPageCount))) {
-      statementImport.processedPageCount = Number(meta.processedPageCount);
+  const run = async () => {
+    try {
+      const entry = { step, label, percent: config.percent, meta: meta || null, at: new Date() };
+      statementImport.progress = [...(statementImport.progress || []), entry].slice(-40);
+      // Don't let percent go backwards (parallel batches can finish out of order).
+      statementImport.progressStep = step;
+      statementImport.progressPercent = Math.max(statementImport.progressPercent || 0, config.percent);
+      if (meta && Number.isFinite(Number(meta.pageCount))) statementImport.pageCount = Number(meta.pageCount);
+      if (meta && Number.isFinite(Number(meta.processedPageCount))) {
+        statementImport.processedPageCount = Number(meta.processedPageCount);
+      }
+      await statementImport.save();
+      publishStatementImportEvent(statementImport._id, { type: step, label, percent: config.percent, meta: meta || null });
+    } catch (_error) {
+      // Swallow — progress is non-critical.
     }
-    await statementImport.save();
-    publishStatementImportEvent(statementImport._id, { type: step, label, percent: config.percent, meta: meta || null });
-  } catch (_error) {
-    // Swallow — progress is non-critical.
-  }
+  };
+
+  // Serialize saves on this document. Parallel page batches call emitProgress
+  // concurrently, which would otherwise trigger mongoose ParallelSaveError.
+  const prev = statementImport.__progressChain || Promise.resolve();
+  const next = prev.then(run, run);
+  statementImport.__progressChain = next;
+  return next;
 };
 
 const IMPORT_SOURCE_TYPE = 'import_job';
@@ -336,7 +346,13 @@ const buildStatementRows = async (statementImport, parsedRows) => {
     );
 
     const duplicateInfo = await detectDuplicateForRow(statementImport.userId, parsedRow);
-    const localDuplicateKey = parsedRow.transactionId || duplicateInfo.duplicateHash;
+    // A row is a within-statement duplicate only when its full content fingerprint
+    // (amount + date + description + balance + counterParty, via duplicateHash)
+    // AND its transaction reference match. Bank charges (SMS alert, transaction
+    // charge, stamp duty, VAT) often share a session/account reference with their
+    // parent transfer but have different amounts/descriptions, so they must NOT be
+    // collapsed into one. Different reference ⇒ kept as distinct.
+    const localDuplicateKey = `${duplicateInfo.duplicateHash}|${parsedRow.transactionId || ''}`;
     const isLocalDuplicate = seenKeys.has(localDuplicateKey);
     seenKeys.add(localDuplicateKey);
 
@@ -434,10 +450,16 @@ const extractViaPageImages = async (statementImport, filePath) => {
       return null;
     }
 
-    // Optional, non-fatal audit pass (lighter/fast deployment). Findings are
-    // surfaced as warnings on the import; nothing is saved here.
-    const audit = await auditExtractedRows({ rows: extraction.rows, statement: extraction.statement });
-    const warnings = [...(extraction.warnings || []), ...(audit.warnings || [])];
+    // Optional second AI pass (audit). OFF by default so extracted rows reach the
+    // review screen immediately — it adds another LLM round-trip. Enable with
+    // AZURE_OPENAI_STATEMENT_AUDIT=true when you want the extra quality warnings.
+    let auditSuggestions = [];
+    const warnings = [...(extraction.warnings || [])];
+    if (String(process.env.AZURE_OPENAI_STATEMENT_AUDIT || '').toLowerCase() === 'true') {
+      const audit = await auditExtractedRows({ rows: extraction.rows, statement: extraction.statement });
+      warnings.push(...(audit.warnings || []));
+      auditSuggestions = audit.rowSuggestions || [];
+    }
 
     const parsed = {
       rows: extraction.rows,
@@ -447,7 +469,7 @@ const extractViaPageImages = async (statementImport, filePath) => {
       extractionMetadata: {
         ...extraction.metadata,
         statement: extraction.statement || null,
-        auditSuggestions: audit.rowSuggestions || [],
+        auditSuggestions,
         confidenceSummary: summarizeRowsConfidence(extraction.rows),
       },
     };
@@ -624,6 +646,25 @@ const processStatementImportJob = async ({ statementImportId, filePath }) => {
     statementImport.importedRows = counters.importedRows;
     await statementImport.save();
     await emitProgress(statementImport, 'import.ready', { totalRows: counters.totalRows });
+
+    // Notify the user their statement finished processing and is ready to review.
+    // Lets them leave the screen during the (possibly minutes-long) extraction.
+    if (counters.totalRows > 0) {
+      const { addNotificationJob } = require('../config/queue');
+      await addNotificationJob({
+        userId: statementImport.userId,
+        type: 'import_ready',
+        urgency: 'instant',
+        data: {
+          statementImportId: String(statementImport._id),
+          fileName: statementImport.fileName,
+          totalRows: counters.totalRows,
+          readyRows: counters.readyRows,
+          needsReviewRows: counters.needsReviewRows,
+          duplicateRows: counters.duplicateRows,
+        },
+      }).catch(() => undefined);
+    }
 
     return {
       success: true,
@@ -840,8 +881,18 @@ const buildImportPayloads = async (statementImport, rows) => {
   const incomes = [];
   const mappings = [];
 
+  // Guarantee a unique externalId per row within this import. Nigerian statements
+  // reuse a session/account reference across a transfer and its charges (SMS
+  // alert, transaction charge, stamp duty, VAT), so transactionId is NOT unique.
+  // The row _id is always unique, so it disambiguates any collision.
+  const usedExternalIds = new Set();
+
   for (const row of rows) {
-    const rawExternalId = row.transactionId || row.duplicateHash || String(row._id);
+    let rawExternalId = row.transactionId || row.duplicateHash || String(row._id);
+    if (usedExternalIds.has(rawExternalId)) {
+      rawExternalId = `${rawExternalId}:${row._id}`;
+    }
+    usedExternalIds.add(rawExternalId);
     const scopedExternalId = buildScopedImportExternalId(statementImport._id, rawExternalId);
 
     if (row.classification === 'expense') {
@@ -921,12 +972,31 @@ const confirmStatementImport = async (userId, statementImportId) => {
   }
 
   const payloads = await buildImportPayloads(statementImport, rows);
-  const [createdExpenses, createdIncomes] = await Promise.all([
-    payloads.expenses.length ? Expense.insertMany(payloads.expenses, { ordered: true }) : [],
-    payloads.incomes.length ? Income.insertMany(payloads.incomes, { ordered: true }) : [],
+
+  // Idempotent insert: a previous confirm may have partially inserted before
+  // failing. Skip rows whose (unique, import-scoped) externalId already exists so
+  // a retry completes cleanly instead of crashing on duplicate keys.
+  const scopedIds = [
+    ...payloads.expenses.map((p) => p.externalId),
+    ...payloads.incomes.map((p) => p.externalId),
+  ];
+  const [existingExpenses, existingIncomes] = await Promise.all([
+    Expense.find({ userId, externalId: { $in: scopedIds } }).select('_id externalId').lean(),
+    Income.find({ userId, externalId: { $in: scopedIds } }).select('_id externalId').lean(),
   ]);
 
   const externalIdToTransactionId = new Map();
+  existingExpenses.forEach((e) => externalIdToTransactionId.set(e.externalId, e._id));
+  existingIncomes.forEach((i) => externalIdToTransactionId.set(i.externalId, i._id));
+
+  const newExpenses = payloads.expenses.filter((p) => !externalIdToTransactionId.has(p.externalId));
+  const newIncomes = payloads.incomes.filter((p) => !externalIdToTransactionId.has(p.externalId));
+
+  const [createdExpenses, createdIncomes] = await Promise.all([
+    newExpenses.length ? Expense.insertMany(newExpenses, { ordered: false }) : [],
+    newIncomes.length ? Income.insertMany(newIncomes, { ordered: false }) : [],
+  ]);
+
   for (const expense of createdExpenses) {
     externalIdToTransactionId.set(expense.externalId, expense._id);
   }

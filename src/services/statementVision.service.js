@@ -40,6 +40,13 @@ const SYSTEM_PROMPT = [
   '- If the date is unclear, set transactionDate null and status "needs_review".',
   '- If a row is uncertain, give it low confidence and status "needs_review".',
   '- Confidence values are numbers between 0 and 1.',
+  '',
+  'BANK CHARGES & REFERENCES (important for Nigerian statements):',
+  '- Bank charges are REAL, separate transactions. Extract each as its own row: SMS alert charge, transaction/transfer charge, stamp duty, VAT, COT, and maintenance/account fees. Do NOT merge a charge into its parent transfer and do NOT skip it.',
+  '- A transfer and its related charge(s) often share the same session or account reference number, but they are DIFFERENT transactions with different amounts — keep them as separate rows.',
+  '- For transactionId, use the reference that is UNIQUE to that single transaction line. Never copy the same reference onto more than one row, and never use the shared account number as the transactionId. If a row has no unique reference of its own, set transactionId to null.',
+  '- Two rows are only the same transaction if their amount, date, description AND reference all match. If anything differs, treat them as separate.',
+  '',
   '- Return JSON only. No markdown. No prose outside the JSON.',
 ].join('\n');
 
@@ -210,9 +217,10 @@ const callVisionModel = async ({ pageDataUrls, pageNumbers, repair = false }) =>
     temperature: 0.1,
     timeoutMs: VISION_TIMEOUT_MS,
     maxRetries: 0,
-    // Statement extraction is structured, not a deep-reasoning task — keep the
-    // reasoning effort low so gpt-5.x responds fast enough for vision.
-    reasoningEffort: process.env.AZURE_OPENAI_STATEMENT_REASONING_EFFORT || 'low',
+    // Statement extraction is structured, not a deep-reasoning task — default to
+    // minimal reasoning so gpt-5.x responds fast. Bump via env if accuracy on
+    // complex statements needs it (minimal | low | medium | high).
+    reasoningEffort: process.env.AZURE_OPENAI_STATEMENT_REASONING_EFFORT || 'minimal',
   });
 };
 
@@ -242,71 +250,87 @@ const extractRowsFromPageImages = async ({ pages = [], batchSize = DEFAULT_BATCH
   }
 
   const batches = chunkPages(pages, batchSize);
-  const allRows = [];
-  const warnings = [];
-  let bestStatement = null;
-  let bestStructure = null;
-  let failedBatches = 0;
-  let rowCounter = 0;
-  let aborted = false;
 
   await emit({ type: 'ai.reading.started', totalBatches: batches.length });
 
-  for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-    const batch = batches[batchIndex];
+  // Process one batch: read its page image(s), call the vision model (with one
+  // JSON-repair retry), and return the parsed payload or a failure marker.
+  const runBatch = async (batch, batchIndex) => {
     const pageNumbers = batch.map((p) => p.pageNumber);
     for (const pageNumber of pageNumbers) {
       // eslint-disable-next-line no-await-in-loop
       await emit({ type: 'ai.reading.page', pageNumber });
     }
 
-    let hardFailure = false;
+    let result;
     try {
       const pageDataUrls = await Promise.all(batch.map((page) => readPageAsDataUrl(page)));
-
       let completion = await callVisionModel({ pageDataUrls, pageNumbers });
-      // Repair retry once if the model returned text but not parseable JSON.
       if (completion && !completion.json && completion.text) {
         completion = await callVisionModel({ pageDataUrls, pageNumbers, repair: true });
       }
-
-      if (!completion || !completion.json) {
-        failedBatches += 1;
-        hardFailure = true;
-        warnings.push(`Could not read page(s) ${pageNumbers.join(', ')} clearly.`);
-      } else {
-        const parsed = parseVisionPayload(completion.json, batch);
-        parsed.rows.forEach((row) => {
-          rowCounter += 1;
-          row.sourceIndex = rowCounter;
-          allRows.push(row);
-        });
-        warnings.push(...parsed.warnings);
-
-        // Keep the statement/structure metadata with the highest confidence.
-        if (parsed.statement && Number(parsed.statement.confidence || 0) >= Number(bestStatement?.confidence || 0)) {
-          bestStatement = parsed.statement;
-        }
-        if (parsed.structure && Number(parsed.structure.confidence || 0) >= Number(bestStructure?.confidence || 0)) {
-          bestStructure = parsed.structure;
-        }
-      }
+      result =
+        !completion || !completion.json
+          ? { failed: true, pageNumbers }
+          : { parsed: parseVisionPayload(completion.json, batch) };
     } catch (_error) {
-      failedBatches += 1;
-      hardFailure = true;
-      warnings.push(`Could not read page(s) ${pageNumbers.join(', ')} clearly.`);
+      result = { failed: true, pageNumbers };
     }
 
     await emit({ type: 'ai.extraction.completed', batchIndex, totalBatches: batches.length });
+    return result;
+  };
 
-    // Fail fast: if the very first batch times out/errors with no rows, the
-    // model/endpoint is unhealthy for vision right now. Abort so the caller can
-    // fall back to the whole-PDF path instead of wasting a timeout per batch.
-    if (hardFailure && allRows.length === 0 && batchIndex === 0) {
-      aborted = true;
-      break;
+  // Run batches concurrently (bounded) so a multi-page statement isn't N×slower.
+  // Bounded to protect Azure rate limits; configurable via env.
+  const concurrency = Math.max(
+    1,
+    Math.min(Number(process.env.AZURE_OPENAI_STATEMENT_CONCURRENCY) || 3, batches.length || 1),
+  );
+  const results = new Array(batches.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (true) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= batches.length) break;
+      results[index] = await runBatch(batches[index], index);
     }
-  }
+  };
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  // Merge results in original page order, preserving page/row metadata.
+  const allRows = [];
+  const warnings = [];
+  let bestStatement = null;
+  let bestStructure = null;
+  let failedBatches = 0;
+  let rowCounter = 0;
+
+  results.forEach((result) => {
+    if (!result || result.failed) {
+      failedBatches += 1;
+      warnings.push(`Could not read page(s) ${(result?.pageNumbers || []).join(', ')} clearly.`);
+      return;
+    }
+    const { parsed } = result;
+    parsed.rows.forEach((row) => {
+      rowCounter += 1;
+      row.sourceIndex = rowCounter;
+      allRows.push(row);
+    });
+    warnings.push(...parsed.warnings);
+    if (parsed.statement && Number(parsed.statement.confidence || 0) >= Number(bestStatement?.confidence || 0)) {
+      bestStatement = parsed.statement;
+    }
+    if (parsed.structure && Number(parsed.structure.confidence || 0) >= Number(bestStructure?.confidence || 0)) {
+      bestStructure = parsed.structure;
+    }
+  });
+
+  // "Aborted" = every batch failed (e.g. model unhealthy/timing out) so the
+  // caller can fall back to the whole-PDF path instead of trusting an empty result.
+  const aborted = allRows.length === 0 && failedBatches > 0 && failedBatches === batches.length;
 
   return {
     rows: allRows,

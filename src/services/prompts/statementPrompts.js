@@ -101,6 +101,8 @@ Rules:
 - If the row looks like money entering the account, use classification "income".
 - Treat "transfer to", wallet top-ups, and similar outgoing transfers as "expense".
 - Treat "transfer from", incoming transfers, and received transfers as "income".
+- Bank charges are REAL separate transactions: extract SMS alert charge, transaction/transfer charge, stamp duty, VAT, COT, and maintenance fees each as its own row. A transfer and its charges may share a session/account reference but are different transactions — keep them separate.
+- For transactionId, use the reference unique to that single row. Never copy the same reference onto more than one row and never use the shared account number; if a row has no unique reference, use null.
 - Amount, debit, and credit must be positive numbers when present.
 - Confidence must be honest. Use lower confidence when dates, amounts, or direction are unclear.
 - Do not include markdown.

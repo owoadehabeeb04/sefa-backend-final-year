@@ -18,6 +18,7 @@ const getIconForType = (type) => {
     spending_insight: 'alert',
     goal_progress: 'goal',
     import_complete: 'import',
+    import_ready: 'import',
   };
   return iconMap[type] || 'info';
 };
@@ -48,7 +49,8 @@ const processNotificationJob = async (job) => {
       budget_warning: 'budgetWarnings',
       weekly_summary: 'weeklyReports',
       goal_progress: 'goalUpdates',
-      import_complete: 'importNotifications'
+      import_complete: 'importNotifications',
+      import_ready: 'importNotifications'
     };
     const preferenceKey = typeMap[type];
     if (preferenceKey && !preferences[preferenceKey]) {

@@ -257,7 +257,10 @@ const generateNotificationTitle = (type, data) => {
       
     case 'import_complete':
       return 'Bank Import Complete';
-      
+
+    case 'import_ready':
+      return 'Statement ready for review';
+
     default:
       return 'Financial Update';
   }
@@ -287,8 +290,11 @@ const generateNotificationBody = (type, data) => {
       return `${data.progressPercentage}% complete`;
       
     case 'import_complete':
-      return `Imported ${data.importedCount} transactions from ${data.source || 'bank'}`;
-      
+      return `Imported ${data.importedRows ?? data.importedCount ?? 0} transactions from ${data.source || data.fileName || 'your statement'}`;
+
+    case 'import_ready':
+      return `We found ${data.totalRows} transaction${data.totalRows === 1 ? '' : 's'} in ${data.fileName || 'your statement'}. Tap to review and import.`;
+
     default:
       return 'Check your SEFA app for details';
   }
