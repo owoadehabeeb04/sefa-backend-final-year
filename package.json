@@ -25,6 +25,8 @@
   "dependencies": {
     "@azure/ai-form-recognizer": "^5.0.0",
     "@google-cloud/vision": "^4.1.0",
+    "@langchain/core": "^1.1.49",
+    "@langchain/langgraph": "^1.4.2",
     "axios": "^1.6.2",
     "bcryptjs": "^2.4.3",
     "bull": "^4.12.0",
@@ -48,6 +50,7 @@
     "node-cron": "^3.0.3",
     "openai": "^6.42.0",
     "pdf-parse": "^1.1.1",
+    "pdf-to-img": "^4.5.0",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.0",
     "tesseract.js": "^5.1.1",

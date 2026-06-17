@@ -41,4 +41,7 @@ const categorySchema = new mongoose.Schema({
 categorySchema.index({ userId: 1, type: 1, isActive: 1 });
 categorySchema.index({ userId: 1, type: 1, name: 1 }, { unique: true });
 
+// Invalidate cached insight snapshots when categories change.
+categorySchema.plugin(require('./plugins/invalidateInsightSnapshot'));
+
 module.exports = mongoose.model('Category', categorySchema);

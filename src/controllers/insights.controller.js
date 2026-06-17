@@ -8,6 +8,8 @@ const insightHubService = require('../services/insights/insightHub.service');
 const forecastService = require('../services/insights/forecast.service');
 const healthScoreService = require('../services/insights/healthScore.service');
 const copilotService = require('../services/insights/copilot.service');
+const insightSnapshotService = require('../services/insights/insightSnapshot.service');
+const insightAiSummaryService = require('../services/insights/insightAiSummary.service');
 
 /**
  * @swagger
@@ -420,6 +422,229 @@ exports.getMonthlyComparison = async (req, res) => {
   } catch (error) {
     console.error('Get monthly comparison error:', error);
     return errorResponse(res, 'Failed to generate monthly comparison', 500);
+  }
+};
+
+/* ------------------------------------------------------------------ *
+ * Financial Intelligence Dashboard (calculated-first, AI explains)
+ * ------------------------------------------------------------------ */
+
+const resolvePeriodKey = (req) => {
+  const raw = String(req.query.period || req.query.periodKey || '').trim();
+  return /^\d{4}-\d{2}$/.test(raw) ? raw : undefined;
+};
+
+/**
+ * Full layered dashboard payload (snapshot + breakdown + drivers + savings +
+ * budget health). Cached via MonthlyInsightSnapshot. AI summary is loaded
+ * separately (or streamed) so the dashboard renders fast.
+ * @route GET /api/v1/insights/dashboard
+ */
+exports.getDashboard = async (req, res) => {
+  try {
+    const dashboard = await insightSnapshotService.getDashboard(req.user._id, {
+      periodKey: resolvePeriodKey(req),
+      forceRefresh: req.query.refresh === 'true',
+    });
+    return successResponse(res, dashboard, 'Insights dashboard generated successfully');
+  } catch (error) {
+    console.error('Get insights dashboard error:', error);
+    return errorResponse(res, 'Failed to generate insights dashboard', 500);
+  }
+};
+
+/**
+ * Financial snapshot only (Layer 1).
+ * @route GET /api/v1/insights/overview
+ */
+exports.getOverview = async (req, res) => {
+  try {
+    const dashboard = await insightSnapshotService.getDashboard(req.user._id, {
+      periodKey: resolvePeriodKey(req),
+      forceRefresh: req.query.refresh === 'true',
+    });
+    return successResponse(
+      res,
+      {
+        period: dashboard.period,
+        periodKey: dashboard.periodKey,
+        hasData: dashboard.hasData,
+        hasBudgets: dashboard.hasBudgets,
+        lastCalculatedAt: dashboard.lastCalculatedAt,
+        ...dashboard.snapshot,
+      },
+      'Financial overview generated successfully'
+    );
+  } catch (error) {
+    console.error('Get insights overview error:', error);
+    return errorResponse(res, 'Failed to generate financial overview', 500);
+  }
+};
+
+/**
+ * Category breakdown + pie chart data (Layer 2).
+ * @route GET /api/v1/insights/category-breakdown
+ */
+exports.getCategoryBreakdown = async (req, res) => {
+  try {
+    const dashboard = await insightSnapshotService.getDashboard(req.user._id, {
+      periodKey: resolvePeriodKey(req),
+    });
+    return successResponse(
+      res,
+      {
+        period: dashboard.period,
+        hasData: dashboard.hasData,
+        totalExpenses: dashboard.snapshot.totalExpenses,
+        categoryBreakdown: dashboard.categoryBreakdown,
+        pieChart: dashboard.pieChart,
+      },
+      'Category breakdown generated successfully'
+    );
+  } catch (error) {
+    console.error('Get category breakdown error:', error);
+    return errorResponse(res, 'Failed to generate category breakdown', 500);
+  }
+};
+
+/**
+ * Spending drivers — "what's taking most of your money" (Layer 3).
+ * @route GET /api/v1/insights/spending-drivers
+ */
+exports.getSpendingDrivers = async (req, res) => {
+  try {
+    const dashboard = await insightSnapshotService.getDashboard(req.user._id, {
+      periodKey: resolvePeriodKey(req),
+    });
+    return successResponse(
+      res,
+      {
+        period: dashboard.period,
+        hasData: dashboard.hasData,
+        spendingDrivers: dashboard.spendingDrivers,
+      },
+      'Spending drivers generated successfully'
+    );
+  } catch (error) {
+    console.error('Get spending drivers error:', error);
+    return errorResponse(res, 'Failed to generate spending drivers', 500);
+  }
+};
+
+/**
+ * Savings opportunities (Layer 3).
+ * @route GET /api/v1/insights/savings-opportunities
+ */
+exports.getSavingsOpportunities = async (req, res) => {
+  try {
+    const dashboard = await insightSnapshotService.getDashboard(req.user._id, {
+      periodKey: resolvePeriodKey(req),
+    });
+    return successResponse(
+      res,
+      {
+        period: dashboard.period,
+        hasData: dashboard.hasData,
+        savingsPotential: dashboard.snapshot.savingsPotential,
+        savingsSummary: dashboard.savingsSummary,
+        savingsOpportunities: dashboard.savingsOpportunities,
+      },
+      'Savings opportunities generated successfully'
+    );
+  } catch (error) {
+    console.error('Get savings opportunities error:', error);
+    return errorResponse(res, 'Failed to generate savings opportunities', 500);
+  }
+};
+
+/**
+ * Budget health (Layer 3).
+ * @route GET /api/v1/insights/budget-health
+ */
+exports.getBudgetHealth = async (req, res) => {
+  try {
+    const dashboard = await insightSnapshotService.getDashboard(req.user._id, {
+      periodKey: resolvePeriodKey(req),
+    });
+    return successResponse(
+      res,
+      {
+        period: dashboard.period,
+        hasData: dashboard.hasData,
+        hasBudgets: dashboard.hasBudgets,
+        budgetUsage: dashboard.snapshot.budgetUsage,
+        budgetHealth: dashboard.budgetHealth,
+      },
+      'Budget health generated successfully'
+    );
+  } catch (error) {
+    console.error('Get budget health error:', error);
+    return errorResponse(res, 'Failed to generate budget health', 500);
+  }
+};
+
+/**
+ * Grounded AI summary (buffered). Reads the cached dashboard, asks the AI to
+ * explain (never invent) the numbers, persists the summary onto the snapshot.
+ * @route GET /api/v1/insights/summary
+ */
+exports.getSummary = async (req, res) => {
+  try {
+    const periodKey = resolvePeriodKey(req);
+    const dashboard = await insightSnapshotService.getDashboard(req.user._id, { periodKey });
+    const summary = await insightAiSummaryService.generateSummary(dashboard);
+    await insightSnapshotService.saveAiSummary(req.user._id, dashboard.periodKey, summary);
+    return successResponse(res, { period: dashboard.period, aiSummary: summary }, 'Insight summary generated successfully');
+  } catch (error) {
+    console.error('Get insight summary error:', error);
+    return errorResponse(res, 'Failed to generate insight summary', 500);
+  }
+};
+
+/**
+ * Streaming grounded AI summary via SSE (Layer 4).
+ * @route GET /api/v1/insights/summary/stream
+ */
+exports.streamSummary = async (req, res) => {
+  const sendEvent = (type, payload) => {
+    res.write(`event: ${type}\n`);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  try {
+    const periodKey = resolvePeriodKey(req);
+    const dashboard = await insightSnapshotService.getDashboard(req.user._id, { periodKey });
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    sendEvent('ready', { period: dashboard.period, hasData: dashboard.hasData });
+
+    let closed = false;
+    req.on('close', () => {
+      closed = true;
+    });
+
+    const finalSummary = await insightAiSummaryService.streamSummary(dashboard, async ({ delta, fullText, isFinal }) => {
+      if (closed) return;
+      if (delta) sendEvent('delta', { delta, fullText });
+      if (isFinal) sendEvent('done', { fullText });
+    });
+
+    if (!closed) {
+      await insightSnapshotService.saveAiSummary(req.user._id, dashboard.periodKey, finalSummary);
+      sendEvent('summary', { aiSummary: finalSummary });
+      res.end();
+    }
+  } catch (error) {
+    console.error('Stream insight summary error:', error);
+    if (!res.headersSent) {
+      return errorResponse(res, 'Failed to stream insight summary', 500);
+    }
+    sendEvent('error', { message: 'Failed to stream insight summary' });
+    res.end();
   }
 };
 

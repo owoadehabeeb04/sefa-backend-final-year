@@ -330,4 +330,7 @@ BudgetSchema.statics.createOrUpdate = async function(userId, category, amount, o
   });
 };
 
+// Invalidate cached insight snapshots when budgets change.
+BudgetSchema.plugin(require('./plugins/invalidateInsightSnapshot'));
+
 module.exports = mongoose.model('Budget', BudgetSchema);

@@ -21,4 +21,8 @@ router.post('/chats/:chatId/messages/:messageId/regenerate', assistantController
 router.post('/chats/:chatId/messages/:messageId/retry', assistantController.retryMessage);
 router.post('/chats/:chatId/messages/:messageId/cancel', assistantController.cancelMessage);
 
+router.post('/actions/:actionId/confirm', assistantController.confirmAction);
+router.post('/actions/:actionId/cancel', assistantController.cancelAction);
+router.post('/actions/:actionId/edit', assistantController.editAction);
+
 module.exports = router;

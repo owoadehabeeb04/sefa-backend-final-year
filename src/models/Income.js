@@ -213,4 +213,7 @@ incomeSchema.pre('save', async function(next) {
   next();
 });
 
+// Invalidate cached insight snapshots when income changes.
+incomeSchema.plugin(require('./plugins/invalidateInsightSnapshot'));
+
 module.exports = mongoose.model('Income', incomeSchema);

@@ -6,14 +6,53 @@ const { processNotificationJob } = require('../workers/notificationProcessor');
 const { processQueuedStatementImport } = require('../workers/statementImportProcessor');
 const { processQueuedAssistantJob } = require('../workers/assistantProcessor');
 
-const redisConfig = {
-  host: process.env.REDIS_URL?.split('://')[1]?.split(':')[0] || 'localhost',
-  port: parseInt(process.env.REDIS_URL?.split(':')[2], 10) || 6379,
-  password: process.env.REDIS_PASSWORD || undefined,
-  db: parseInt(process.env.REDIS_DB, 10) || 0,
-  maxRetriesPerRequest: null,
-  enableReadyCheck: false,
+const parseRedisUrlConfig = () => {
+  const redisUrl = String(process.env.REDIS_URL || '').trim();
+
+  if (!redisUrl) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('REDIS_URL is required in production. Provision Redis/Render Key Value and set REDIS_URL.');
+    }
+
+    return {
+      host: 'localhost',
+      port: 6379,
+      password: process.env.REDIS_PASSWORD || undefined,
+      db: parseInt(process.env.REDIS_DB, 10) || 0,
+      maxRetriesPerRequest: null,
+      enableReadyCheck: false,
+    };
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(redisUrl);
+  } catch (_error) {
+    throw new Error('REDIS_URL is invalid. Use a full Redis URL like redis://default:password@host:6379.');
+  }
+
+  const dbFromPath = parsed.pathname?.replace(/^\//, '').trim();
+  const db = Number.isFinite(parseInt(dbFromPath, 10))
+    ? parseInt(dbFromPath, 10)
+    : (parseInt(process.env.REDIS_DB, 10) || 0);
+
+  const config = {
+    host: parsed.hostname || 'localhost',
+    port: parseInt(parsed.port, 10) || 6379,
+    password: parsed.password || process.env.REDIS_PASSWORD || undefined,
+    db,
+    maxRetriesPerRequest: null,
+    enableReadyCheck: false,
+  };
+
+  if (parsed.protocol === 'rediss:') {
+    config.tls = {};
+  }
+
+  return config;
 };
+
+const redisConfig = parseRedisUrlConfig();
 
 const redisClient = new Redis(redisConfig);
 
@@ -37,7 +76,7 @@ const assistantQueue = new Queue('assistant', queueOptions);
 
 const setupQueueHandlers = (queue, queueName) => {
   queue.on('error', (error) => {
-    console.error(`❌ ${queueName} queue error:`, error.message);
+    console.error(`❌ ${queueName} queue error:`, error.message || error);
   });
 
   queue.on('waiting', (jobId) => {
@@ -66,6 +105,14 @@ setupQueueHandlers(notificationQueue, 'Notification');
 setupQueueHandlers(statementImportQueue, 'Statement import');
 setupQueueHandlers(assistantQueue, 'Assistant');
 
+redisClient.on('error', (error) => {
+  console.error('❌ Redis connection error:', error.message || error);
+});
+
+redisClient.on('connect', () => {
+  console.log(`✅ Redis connected at ${redisConfig.host}:${redisConfig.port}`);
+});
+
 const addSyncJob = async (data, options = {}) => {
   return syncQueue.add('sync-transactions', data, {
     priority: data.priority || 2,
@@ -85,7 +132,9 @@ const addNotificationJob = async (data) => {
 const addStatementImportJob = async (data) => {
   return statementImportQueue.add('process-statement-import', data, {
     priority: 2,
-    timeout: 240000,
+    // Headroom for slow vision (reasoning) batches plus a possible fallback to
+    // the whole-PDF extraction path and per-row categorization.
+    timeout: 600000,
     attempts: 1,
   });
 };

@@ -1,5 +1,6 @@
 const AssistantChat = require('../models/AssistantChat');
 const AssistantMessage = require('../models/AssistantMessage');
+const { attachActionToMessage, planAssistantAction } = require('./assistantAction.service');
 const { publishAssistantChatEvent } = require('./assistantEvents.service');
 const {
   generateAssistantConversationTitle,
@@ -59,6 +60,16 @@ const formatAssistantRetrieval = (retrieval = null) => {
   };
 };
 
+const formatAssistantActions = (actions = []) => (Array.isArray(actions) ? actions : []).map((action) => ({
+  actionId: String(action.actionId || action._id || ''),
+  id: String(action.actionId || action._id || ''),
+  actionType: action.actionType,
+  status: action.status,
+  confirmationMessage: action.confirmationMessage,
+  payload: action.payload || action.extractedPayload || {},
+  missingFields: Array.isArray(action.missingFields) ? action.missingFields : [],
+})).filter((action) => action.actionId);
+
 const formatAssistantMessage = (message) => ({
   id: String(message._id),
   _id: message._id,
@@ -76,6 +87,7 @@ const formatAssistantMessage = (message) => ({
   errorMessage: message.errorMessage || null,
   sources: formatAssistantSources(message.sources || []),
   retrieval: formatAssistantRetrieval(message.retrieval || null),
+  actions: formatAssistantActions(message.actions || []),
   completedAt: message.completedAt || null,
   createdAt: message.createdAt,
   updatedAt: message.updatedAt,
@@ -108,6 +120,14 @@ const emitChatEvent = (chat, lastMessage = null) => {
     chat: formatAssistantChat(chat, lastMessage),
   });
 };
+
+const buildActivityEvent = ({ chatId, assistantMessageId, stage, label }) => ({
+  type: 'assistant.activity',
+  chatId: String(chatId),
+  assistantMessageId: String(assistantMessageId),
+  stage,
+  label,
+});
 
 const getOwnedChat = async (userId, chatId) =>
   AssistantChat.findOne({
@@ -856,13 +876,129 @@ const processAssistantGenerationJob = async ({
   await refreshChatState(chatId);
 
   try {
+    const emitActivity = async (stage, label) => {
+      const event = buildActivityEvent({
+        chatId,
+        assistantMessageId: assistantMessage._id,
+        stage,
+        label,
+      });
+      publishAssistantChatEvent(chatId, event);
+      if (onDelta) {
+        await onDelta(event);
+      }
+    };
+
     const history = await buildActivePromptMessages(chatId, generatedFromMessageId);
+    const latestQuestion = sourceMessage.content || '';
+    await emitActivity('understanding_request', 'Understanding your request...');
+    const actionPlan = await planAssistantAction({
+      userId: chat.userId,
+      chatId,
+      assistantMessageId,
+      text: latestQuestion,
+      history,
+    });
+
+    if (actionPlan) {
+      if (actionPlan.kind === 'confirmation_required') {
+        await emitActivity('preparing_confirmation', 'Preparing your confirmation...');
+      } else if (actionPlan.kind === 'missing_fields') {
+        await emitActivity('checking_details', 'Checking what details are still needed...');
+      } else if (actionPlan.kind === 'action_completed') {
+        await emitActivity('saving_record', 'Saving it to your SEFA records...');
+      }
+
+      assistantMessage.content = actionPlan.text || '';
+      assistantMessage.status = 'completed';
+      assistantMessage.completedAt = new Date();
+      assistantMessage.errorMessage = null;
+      assistantMessage.sources = [];
+      assistantMessage.retrieval = null;
+      await assistantMessage.save();
+
+      if (actionPlan.action) {
+        await attachActionToMessage(assistantMessage._id, actionPlan.action);
+        const refreshed = await AssistantMessage.findById(assistantMessage._id);
+        if (refreshed) {
+          assistantMessage.actions = refreshed.actions || [];
+        }
+
+        if (actionPlan.kind === 'confirmation_required') {
+          publishAssistantChatEvent(chatId, {
+            type: 'confirmation.required',
+            action: formatAssistantActions([actionPlan.action])[0],
+            message: formatAssistantMessage(assistantMessage),
+          });
+        } else if (actionPlan.kind === 'missing_fields') {
+          publishAssistantChatEvent(chatId, {
+            type: 'missing_fields.required',
+            intent: actionPlan.intent,
+            missingFields: actionPlan.missingFields || [],
+            payload: actionPlan.payload || {},
+            message: formatAssistantMessage(assistantMessage),
+          });
+        } else if (actionPlan.kind === 'action_completed') {
+          publishAssistantChatEvent(chatId, {
+            type: 'action.completed',
+            action: formatAssistantActions([actionPlan.action])[0],
+            actionId: String(actionPlan.action._id),
+            actionType: actionPlan.action.actionType,
+            status: actionPlan.action.status,
+            result: actionPlan.action.result || null,
+            message: formatAssistantMessage(assistantMessage),
+          });
+        } else if (actionPlan.kind === 'action_cancelled') {
+          publishAssistantChatEvent(chatId, {
+            type: 'action.cancelled',
+            action: formatAssistantActions([actionPlan.action])[0],
+            actionId: String(actionPlan.action._id),
+            actionType: actionPlan.action.actionType,
+            status: actionPlan.action.status,
+            message: formatAssistantMessage(assistantMessage),
+          });
+        }
+      } else if (actionPlan.kind === 'missing_fields') {
+        publishAssistantChatEvent(chatId, {
+          type: 'missing_fields.required',
+          intent: actionPlan.intent,
+          missingFields: actionPlan.missingFields || [],
+          payload: actionPlan.payload || {},
+          message: formatAssistantMessage(assistantMessage),
+        });
+      } else if (actionPlan.intent) {
+        publishAssistantChatEvent(chatId, {
+          type: 'intent.detected',
+          intent: actionPlan.intent,
+        });
+      }
+
+      emitMessageEvent(chatId, 'message.updated', assistantMessage);
+      await refreshChatState(chatId);
+      if (onDelta) {
+        await onDelta({
+          chatId: String(chatId),
+          assistantMessageId: String(assistantMessage._id),
+          delta: actionPlan.text || '',
+          fullText: actionPlan.text || '',
+          isFinal: true,
+          status: 'completed',
+          actions: formatAssistantActions(assistantMessage.actions || []),
+        });
+      }
+      return {
+        success: true,
+        assistantMessageId: String(assistantMessage._id),
+      };
+    }
+
     let lastPersistedAt = 0;
 
     const generationResult = await streamAssistantCompletion({
       userId: chat.userId,
       chatTitle: chat.title,
       history,
+      onActivity: emitActivity,
       onChunk: async ({ delta, fullText, isFinal }) => {
         const current = await AssistantMessage.findById(assistantMessageId).select('status hiddenAt');
         if (!current || current.status === 'cancelled' || current.status === 'superseded' || current.hiddenAt) {
@@ -920,6 +1056,7 @@ const processAssistantGenerationJob = async ({
     emitMessageEvent(chatId, 'message.updated', assistantMessage);
     await refreshChatState(chatId);
     if (onDelta) {
+      await emitActivity('done', 'Done.');
       await onDelta({
         chatId: String(chatId),
         assistantMessageId: String(assistantMessage._id),

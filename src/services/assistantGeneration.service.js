@@ -259,17 +259,28 @@ const buildAssistantContext = async (userId) => {
   };
 };
 
-const streamAssistantCompletion = async ({ userId, chatTitle, history, onChunk }) => {
+const streamAssistantCompletion = async ({ userId, chatTitle, history, onChunk, onActivity }) => {
+  await onActivity?.('checking_db', 'Checking your SEFA records...');
   const context = await buildAssistantContext(userId);
   const financeSummary = buildFinanceSummary(context);
   const latestQuestion = history[history.length - 1]?.content || '';
+  await onActivity?.('searching_current_info', 'Checking if current information is needed...');
   const retrieval = await resolveAssistantLiveWebContext(latestQuestion);
+  if (retrieval?.mode !== 'none') {
+    await onActivity?.(
+      retrieval.status === 'used' ? 'searching_web' : 'searching_web_unavailable',
+      retrieval.status === 'used'
+        ? 'Searching current information...'
+        : 'Current information search is unavailable...',
+    );
+  }
   const liveWebContext = buildAssistantLiveWebContext({
     question: latestQuestion,
     retrieval,
   });
   const systemPrompt = buildAssistantSystemPrompt({ financeSummary, chatTitle, liveWebContext });
   const messages = buildConversationMessages({ systemPrompt, history });
+  await onActivity?.('preparing_answer', 'Preparing your answer...');
 
   if (process.env.NODE_ENV === 'test') {
     const fallback = buildFallbackAnswer({ hub: context.hub, question: latestQuestion });

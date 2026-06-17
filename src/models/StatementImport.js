@@ -141,6 +141,46 @@ const statementImportSchema = new mongoose.Schema(
       default: null,
       trim: true,
     },
+
+    // --- Live progress (AI-first pipeline) ---
+    // Current step key from the progress taxonomy, e.g. 'ai.reading.page'.
+    progressStep: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    progressPercent: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100,
+    },
+    // Ordered timeline of steps for the story-like mobile screen.
+    progress: {
+      type: [
+        new mongoose.Schema(
+          {
+            step: { type: String, required: true },
+            label: { type: String, default: '' },
+            percent: { type: Number, default: 0 },
+            meta: { type: mongoose.Schema.Types.Mixed, default: null },
+            at: { type: Date, default: Date.now },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+    pageCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    processedPageCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
   },
   {
     timestamps: true,

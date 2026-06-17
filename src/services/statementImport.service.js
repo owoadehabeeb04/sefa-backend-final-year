@@ -15,9 +15,70 @@ const { detectFileType, extractStatementContent, safeUnlink } = require('./state
 const { parseStatementSource } = require('./statementParser.service');
 const { summarizeStatementMetadata } = require('./statementLLM.service');
 const { hasTimeComponent, parseDateValue } = require('./statementStructure.service');
+const { extractRowsFromPageImages, auditExtractedRows } = require('./statementVision.service');
+const { publishStatementImportEvent } = require('./statementImportEvents.service');
+const {
+  isPdfImageConversionAvailable,
+  convertPdfToPageImages,
+  cleanupPageImages,
+  PdfTooLargeError,
+} = require('../utils/pdfToImages');
 
 const FINAL_IMPORT_STATUSES = new Set(['imported', 'cancelled']);
 const ACTIVE_POLL_STATUSES = new Set(['uploaded', 'extracting', 'parsed']);
+
+/**
+ * Progress taxonomy → { friendly label, percent } used to drive both the SSE
+ * stream and the persisted progress timeline the mobile story screen reads.
+ */
+const PROGRESS_STEPS = {
+  'import.created': { label: 'Statement received', percent: 5 },
+  'upload.received': { label: 'Statement received', percent: 8 },
+  'file.validating': { label: 'Checking your file', percent: 12 },
+  'pdf.converting': { label: 'Opening your PDF', percent: 20 },
+  'page.image.created': { label: 'Converting pages for AI reading', percent: 28 },
+  'ai.reading.started': { label: 'Reading your statement', percent: 38 },
+  'ai.reading.page': { label: 'Reading page', percent: 48 },
+  'ai.extraction.completed': { label: 'Finding transaction rows', percent: 62 },
+  'rows.normalizing': { label: 'Mapping dates, descriptions, debit, credit, and balance', percent: 70 },
+  'rows.validating': { label: 'Checking unclear rows', percent: 78 },
+  'categories.suggesting': { label: 'Suggesting categories', percent: 85 },
+  'duplicates.checking': { label: 'Checking possible duplicates', percent: 90 },
+  'review.preparing': { label: 'Preparing your review screen', percent: 96 },
+  'import.ready': { label: 'Ready for review', percent: 100 },
+  'import.failed': { label: 'Import failed', percent: 100 },
+};
+
+/**
+ * Persist a progress step on the import AND publish it for live SSE subscribers.
+ * Best-effort: progress reporting must never break the import itself.
+ *
+ * @param {Object} statementImport - the mongoose doc being processed
+ * @param {string} step - a key from PROGRESS_STEPS
+ * @param {Object} [meta] - optional extra payload (e.g. { pageNumber })
+ */
+const emitProgress = async (statementImport, step, meta = null) => {
+  const config = PROGRESS_STEPS[step] || { label: step, percent: statementImport.progressPercent || 0 };
+  let label = config.label;
+  if (step === 'ai.reading.page' && meta && meta.pageNumber) {
+    label = `Reading page ${meta.pageNumber}`;
+  }
+
+  try {
+    const entry = { step, label, percent: config.percent, meta: meta || null, at: new Date() };
+    statementImport.progress = [...(statementImport.progress || []), entry].slice(-40);
+    statementImport.progressStep = step;
+    statementImport.progressPercent = config.percent;
+    if (meta && Number.isFinite(Number(meta.pageCount))) statementImport.pageCount = Number(meta.pageCount);
+    if (meta && Number.isFinite(Number(meta.processedPageCount))) {
+      statementImport.processedPageCount = Number(meta.processedPageCount);
+    }
+    await statementImport.save();
+    publishStatementImportEvent(statementImport._id, { type: step, label, percent: config.percent, meta: meta || null });
+  } catch (_error) {
+    // Swallow — progress is non-critical.
+  }
+};
 
 const IMPORT_SOURCE_TYPE = 'import_job';
 
@@ -85,6 +146,19 @@ const formatImportForResponse = (statementImport) => ({
   ignoredRows: statementImport.ignoredRows,
   importedRows: statementImport.importedRows,
   errorMessage: statementImport.errorMessage,
+  // Live progress (drives the story-like mobile screen via polling and SSE).
+  progressStep: statementImport.progressStep || null,
+  progressPercent: statementImport.progressPercent || 0,
+  progress: Array.isArray(statementImport.progress)
+    ? statementImport.progress.map((entry) => ({
+        step: entry.step,
+        label: entry.label,
+        percent: entry.percent,
+        at: entry.at,
+      }))
+    : [],
+  pageCount: statementImport.pageCount || 0,
+  processedPageCount: statementImport.processedPageCount || 0,
   isProcessing: ACTIVE_POLL_STATUSES.has(statementImport.status),
   canConfirm: statementImport.status === 'reviewing' && statementImport.readyRows > 0,
   createdAt: statementImport.createdAt,
@@ -323,12 +397,112 @@ const createStatementImportSession = async ({ userId, file }) => {
   });
 };
 
+/**
+ * AI-first PDF extraction: convert pages to images and read them with the vision
+ * deployment in small batches. Returns a `parsed`-shaped object compatible with
+ * the downstream pipeline, plus the page images to clean up. Returns null to
+ * signal the caller should fall back to the existing parser.
+ *
+ * @throws {PdfTooLargeError} when the PDF exceeds the page cap (surfaces a
+ *   friendly error rather than silently falling back).
+ */
+const extractViaPageImages = async (statementImport, filePath) => {
+  let pages = [];
+  try {
+    await emitProgress(statementImport, 'pdf.converting');
+    const conversion = await convertPdfToPageImages(filePath);
+    pages = conversion.pages;
+    if (!pages.length) {
+      return null;
+    }
+    await emitProgress(statementImport, 'page.image.created', { pageCount: conversion.pageCount });
+
+    const extraction = await extractRowsFromPageImages({
+      pages,
+      batchSize: 2,
+      onProgress: async (event) => {
+        await emitProgress(statementImport, event.type, event);
+      },
+    });
+
+    // If vision produced no rows because batches failed/timed out (not because
+    // the statement is genuinely empty), fall back to the whole-PDF path rather
+    // than reporting "no transactions". A clean empty result (no failed batches)
+    // is trusted as-is.
+    if (extraction.rows.length === 0 && Number(extraction.metadata?.failedBatches || 0) > 0) {
+      await cleanupPageImages(pages);
+      return null;
+    }
+
+    // Optional, non-fatal audit pass (lighter/fast deployment). Findings are
+    // surfaced as warnings on the import; nothing is saved here.
+    const audit = await auditExtractedRows({ rows: extraction.rows, statement: extraction.statement });
+    const warnings = [...(extraction.warnings || []), ...(audit.warnings || [])];
+
+    const parsed = {
+      rows: extraction.rows,
+      structure: extraction.structure || null,
+      usedAiFallback: true,
+      warnings,
+      extractionMetadata: {
+        ...extraction.metadata,
+        statement: extraction.statement || null,
+        auditSuggestions: audit.rowSuggestions || [],
+        confidenceSummary: summarizeRowsConfidence(extraction.rows),
+      },
+    };
+
+    return { parsed, pages };
+  } catch (error) {
+    // A too-large PDF is a real failure (friendly message); bubble it up.
+    if (error instanceof PdfTooLargeError) {
+      if (pages.length) await cleanupPageImages(pages);
+      throw error;
+    }
+    // Any other conversion/vision error → clean up and fall back to the old path.
+    if (pages.length) await cleanupPageImages(pages);
+    return null;
+  }
+};
+
+/**
+ * Build the confidence summary used by the import card from normalized rows.
+ */
+const summarizeRowsConfidence = (rows = []) => {
+  const summary = {
+    averageConfidence: 0,
+    highConfidenceCount: 0,
+    mediumConfidenceCount: 0,
+    lowConfidenceCount: 0,
+    unknownConfidenceCount: 0,
+  };
+  if (!rows.length) return summary;
+
+  let total = 0;
+  rows.forEach((row) => {
+    const c = Number(row.confidence);
+    if (!Number.isFinite(c)) {
+      summary.unknownConfidenceCount += 1;
+      return;
+    }
+    total += c;
+    if (c >= 0.75) summary.highConfidenceCount += 1;
+    else if (c >= 0.5) summary.mediumConfidenceCount += 1;
+    else summary.lowConfidenceCount += 1;
+  });
+  summary.averageConfidence = Number((total / rows.length).toFixed(2));
+  return summary;
+};
+
 const processStatementImportJob = async ({ statementImportId, filePath }) => {
   const statementImport = await StatementImport.findById(statementImportId);
   if (!statementImport || statementImport.status === 'cancelled') {
     await safeUnlink(filePath);
     return { success: false, skipped: true };
   }
+
+  // Declared here so the `finally` block can always clean up generated page images.
+  let pageImagesToCleanup = [];
 
   try {
     try {
@@ -340,6 +514,7 @@ const processStatementImportJob = async ({ statementImportId, filePath }) => {
     statementImport.status = 'extracting';
     statementImport.errorMessage = null;
     await statementImport.save();
+    await emitProgress(statementImport, 'file.validating');
 
     const detectedFileType = detectFileType({
       filePath,
@@ -358,23 +533,49 @@ const processStatementImportJob = async ({ statementImportId, filePath }) => {
     statementImport.fileType = statementImport.fileType || detectedFileType;
     await statementImport.save();
 
-    let extractedContent = null;
-    if (!['pdf', 'image'].includes(detectedFileType)) {
-      extractedContent = await extractStatementContent(filePath, {
-        fileName: statementImport.fileName,
-        mimeType: statementImport.fileType,
-      });
+    // --- AI-first path: PDF/image → page images → vision extraction ---
+    // Falls back to the existing file/table parser when conversion or the vision
+    // model is unavailable, so the feature never breaks.
+    let parsed = null;
+
+    if (detectedFileType === 'pdf' && (await isPdfImageConversionAvailable())) {
+      const visionResult = await extractViaPageImages(statementImport, filePath);
+      if (visionResult) {
+        parsed = visionResult.parsed;
+        pageImagesToCleanup = visionResult.pages;
+        statementImport.extractionMethod = 'openai_vision_images';
+        statementImport.extractionModel = String(
+          process.env.AZURE_OPENAI_STATEMENT_MODEL_NAME
+            || process.env.AZURE_OPENAI_STATEMENT_DEPLOYMENT
+            || statementImport.extractionModel,
+        ).trim();
+      }
     }
 
-    const parsed = await parseStatementSource({
-      filePath,
-      fileName: statementImport.fileName,
-      mimeType: statementImport.fileType,
-      fileType: detectedFileType,
-      text: extractedContent?.text || '',
-      tableRows: extractedContent?.tableRows || null,
-      allowAiFallback: true,
-    });
+    if (!parsed) {
+      // Existing path (whole-PDF input_file vision, OCR, or table/CSV parsing).
+      let extractedContent = null;
+      if (!['pdf', 'image'].includes(detectedFileType)) {
+        extractedContent = await extractStatementContent(filePath, {
+          fileName: statementImport.fileName,
+          mimeType: statementImport.fileType,
+        });
+      } else {
+        await emitProgress(statementImport, 'ai.reading.started');
+      }
+
+      parsed = await parseStatementSource({
+        filePath,
+        fileName: statementImport.fileName,
+        mimeType: statementImport.fileType,
+        fileType: detectedFileType,
+        text: extractedContent?.text || '',
+        tableRows: extractedContent?.tableRows || null,
+        allowAiFallback: true,
+      });
+      await emitProgress(statementImport, 'ai.extraction.completed');
+    }
+
     statementImport.status = 'parsed';
     statementImport.extractionConfidenceSummary = parsed.extractionMetadata?.confidenceSummary || {
       averageConfidence: 0,
@@ -387,15 +588,20 @@ const processStatementImportJob = async ({ statementImportId, filePath }) => {
       statementImport.extractionConfidenceSummary.averageConfidence || 0,
     );
     await statementImport.save();
+    await emitProgress(statementImport, 'rows.normalizing');
 
     await StatementImportRow.deleteMany({ statementImportId: statementImport._id });
+    await emitProgress(statementImport, 'rows.validating');
+    await emitProgress(statementImport, 'categories.suggesting');
     const rowDocs = await buildStatementRows(statementImport, parsed.rows);
+    await emitProgress(statementImport, 'duplicates.checking');
     if (rowDocs.length > 0) {
       await StatementImportRow.insertMany(rowDocs, { ordered: false });
     }
 
     const counters = await refreshImportCounters(statementImport._id);
     const period = computePeriod(rowDocs);
+    await emitProgress(statementImport, 'review.preparing');
     const metadata = await summarizeStatementMetadata({
       fileName: statementImport.fileName,
       fileType: detectedFileType,
@@ -405,8 +611,10 @@ const processStatementImportJob = async ({ statementImportId, filePath }) => {
     statementImport.status = 'reviewing';
     statementImport.statementPeriodStart = period.statementPeriodStart;
     statementImport.statementPeriodEnd = period.statementPeriodEnd;
-    statementImport.bankName = metadata.bankName || inferBankName(statementImport.fileName, '');
-    statementImport.currency = metadata.currency || 'NGN';
+    statementImport.bankName = (parsed.extractionMetadata?.statement?.bankName)
+      || metadata.bankName
+      || inferBankName(statementImport.fileName, '');
+    statementImport.currency = metadata.currency || parsed.extractionMetadata?.statement?.currency || 'NGN';
     statementImport.totalRows = counters.totalRows;
     statementImport.readyRows = counters.readyRows;
     statementImport.needsReviewRows = counters.needsReviewRows;
@@ -415,6 +623,7 @@ const processStatementImportJob = async ({ statementImportId, filePath }) => {
     statementImport.ignoredRows = counters.ignoredRows;
     statementImport.importedRows = counters.importedRows;
     await statementImport.save();
+    await emitProgress(statementImport, 'import.ready', { totalRows: counters.totalRows });
 
     return {
       success: true,
@@ -426,8 +635,10 @@ const processStatementImportJob = async ({ statementImportId, filePath }) => {
     statementImport.status = 'failed';
     statementImport.errorMessage = describeStatementImportError(error);
     await statementImport.save().catch(() => undefined);
+    await emitProgress(statementImport, 'import.failed', { message: statementImport.errorMessage }).catch(() => undefined);
     throw error;
   } finally {
+    await cleanupPageImages(pageImagesToCleanup).catch(() => undefined);
     await safeUnlink(filePath);
   }
 };
@@ -841,12 +1052,15 @@ module.exports = {
   cancelStatementImport,
   confirmStatementImport,
   createStatementImportSession,
+  emitProgress,
   formatImportForResponse,
   formatRowForResponse,
   getStatementImportById,
   getStatementImportRows,
   listStatementImports,
+  PROGRESS_STEPS,
   processStatementImportJob,
   refreshImportCounters,
+  summarizeRowsConfidence,
   updateStatementImportRow,
 };

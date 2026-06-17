@@ -1,6 +1,7 @@
 const { successResponse, errorResponse } = require('../utils/response');
 const { addStatementImportJob } = require('../config/queue');
 const { createStatementImportSession, formatImportForResponse, getStatementImportById, getStatementImportRows, listStatementImports, updateStatementImportRow, confirmStatementImport, cancelStatementImport } = require('../services/statementImport.service');
+const { subscribeToStatementImportEvents } = require('../services/statementImportEvents.service');
 
 const resolveDeleteImportStatusCode = (message = '') => {
   if (/not found/i.test(message)) {
@@ -65,6 +66,64 @@ exports.getImport = async (req, res) => {
   } catch (error) {
     console.error('Get statement import error:', error);
     return errorResponse(res, 'Failed to retrieve statement import', 500, error.message);
+  }
+};
+
+/**
+ * Live import progress via SSE. Mirrors the assistant chat stream: verify
+ * ownership, send a snapshot from persisted progress, then push live events.
+ * @route GET /api/v1/statement-imports/:id/events
+ */
+exports.streamImportEvents = async (req, res) => {
+  const sendEvent = (type, payload) => {
+    res.write(`event: ${type}\n`);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  try {
+    const statementImport = await getStatementImportById(req.user.userId, req.params.id);
+    if (!statementImport) {
+      return errorResponse(res, 'Statement import not found', 404);
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    // Snapshot so late subscribers immediately catch up to the current state.
+    sendEvent('ready', {
+      importId: String(statementImport._id),
+      status: statementImport.status,
+      progressStep: statementImport.progressStep || null,
+      progressPercent: statementImport.progressPercent || 0,
+      progress: statementImport.progress || [],
+    });
+
+    // If the import already finished before the client subscribed, end promptly.
+    if (['reviewing', 'imported', 'failed', 'cancelled'].includes(statementImport.status)) {
+      sendEvent('import.settled', { status: statementImport.status });
+    }
+
+    const unsubscribe = subscribeToStatementImportEvents(statementImport._id, (event) => {
+      sendEvent(event.type || 'progress', event);
+    });
+
+    const heartbeat = setInterval(() => {
+      res.write(': keepalive\n\n');
+    }, 15000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      res.end();
+    });
+  } catch (error) {
+    console.error('Stream statement import events error:', error);
+    if (!res.headersSent) {
+      return errorResponse(res, 'Failed to open statement import stream', 500);
+    }
+    res.end();
   }
 };
 

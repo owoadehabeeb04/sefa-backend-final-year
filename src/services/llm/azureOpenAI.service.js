@@ -3,8 +3,9 @@ const { AzureOpenAI, OpenAI } = require('openai');
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_TEMPERATURE = 0.3;
 
-let cachedClient = null;
-let cachedClientCacheKey = null;
+// Clients are cached per resolved config (one per distinct deployment) so the
+// default, statement-vision, and fast deployments can coexist without rebuilding.
+const clientCache = new Map();
 
 const readEnv = (key) => String(process.env[key] || '').trim();
 
@@ -12,12 +13,52 @@ const trimTrailingSlash = (value) => String(value || '').replace(/\/+$/, '');
 
 const isOpenAIV1Endpoint = (endpoint) => /\/openai\/v1\/?$/i.test(String(endpoint || '').trim());
 
-const resolveClientConfig = () => {
-  const endpoint = trimTrailingSlash(readEnv('AZURE_OPENAI_ENDPOINT'));
-  const apiKey = readEnv('AZURE_OPENAI_API_KEY');
-  const deployment = readEnv('AZURE_OPENAI_DEPLOYMENT_NAME');
-  const model = readEnv('AZURE_OPENAI_MODEL_NAME') || deployment;
-  const apiVersion = readEnv('AZURE_OPENAI_API_VERSION');
+/**
+ * Resolve the deployment used for bank-statement image extraction. Falls back to
+ * the default deployment when the dedicated one is not configured. Never hardcoded.
+ */
+const getStatementDeployment = () =>
+  readEnv('AZURE_OPENAI_STATEMENT_DEPLOYMENT') || readEnv('AZURE_OPENAI_DEPLOYMENT_NAME');
+
+/**
+ * Resolve the lighter/faster deployment used for the audit pass and category
+ * cleanup. Falls back to the default deployment.
+ */
+const getFastDeployment = () =>
+  readEnv('AZURE_OPENAI_FAST_DEPLOYMENT') || readEnv('AZURE_OPENAI_DEPLOYMENT_NAME');
+
+/**
+ * The statement-vision profile may live on its own Azure resource. Honor the
+ * dedicated AZURE_OPENAI_STATEMENT_* vars when present, falling back to the
+ * default endpoint/key/deployment. Returns an override object for resolveClientConfig.
+ */
+const getStatementProfile = () => ({
+  endpoint: readEnv('AZURE_OPENAI_STATEMENT_ENDPOINT') || undefined,
+  apiKey: readEnv('AZURE_OPENAI_STATEMENT_API_KEY') || undefined,
+  deployment: getStatementDeployment() || undefined,
+  model: readEnv('AZURE_OPENAI_STATEMENT_MODEL_NAME') || undefined,
+});
+
+/**
+ * Resolve the Azure/OpenAI client config.
+ * @param {string|Object} [override] - either a deployment name string, or an
+ *   options object { endpoint, apiKey, deployment, model, apiVersion } to target
+ *   a specific deployment (and optionally its own Azure resource) for this call.
+ */
+const resolveClientConfig = (override) => {
+  const overrides = typeof override === 'string' ? { deployment: override } : override || {};
+
+  const endpoint = trimTrailingSlash(overrides.endpoint || readEnv('AZURE_OPENAI_ENDPOINT'));
+  const apiKey = overrides.apiKey || readEnv('AZURE_OPENAI_API_KEY');
+  const defaultDeployment = readEnv('AZURE_OPENAI_DEPLOYMENT_NAME');
+  const apiVersion = overrides.apiVersion || readEnv('AZURE_OPENAI_API_VERSION');
+
+  const deployment = String(overrides.deployment || '').trim() || defaultDeployment;
+  // In openai-v1 mode the request `model` IS the deployment name, so an override
+  // changes the model. In azure-deployment mode the override drives the client's
+  // deployment binding. When no MODEL_NAME is set, the deployment doubles as model.
+  const model =
+    overrides.model || (overrides.deployment ? deployment : readEnv('AZURE_OPENAI_MODEL_NAME') || defaultDeployment);
 
   if (!endpoint || !apiKey || !deployment || !model || !apiVersion) {
     return null;
@@ -64,6 +105,18 @@ const buildTokenLimitParams = (maxTokens) => {
   };
 };
 
+/**
+ * Build per-request options for the SDK, omitting undefined values. The OpenAI
+ * SDK rejects `{ timeout: undefined }` ("timeout must be an integer"), so we only
+ * include keys that are actually set.
+ */
+const buildRequestOptions = ({ timeoutMs, maxRetries } = {}) => {
+  const options = {};
+  if (Number.isFinite(Number(timeoutMs))) options.timeout = Number(timeoutMs);
+  if (Number.isFinite(Number(maxRetries))) options.maxRetries = Number(maxRetries);
+  return options;
+};
+
 const modelRequiresDefaultSampling = (model) => /^gpt-5(\.|-|$)/i.test(String(model || '').trim());
 
 const buildSamplingParams = ({ model, temperature, topP }) => {
@@ -84,23 +137,37 @@ const buildSamplingParams = ({ model, temperature, topP }) => {
   return params;
 };
 
+/**
+ * gpt-5.x are reasoning models that reason heavily by default, which is slow for
+ * structured tasks like statement extraction. Allow callers to dial it down via
+ * `reasoning_effort` ('minimal' | 'low' | 'medium' | 'high'). Only applied to
+ * gpt-5 style models (the param is rejected by non-reasoning models).
+ */
+const buildReasoningParams = ({ model, reasoningEffort }) => {
+  if (!reasoningEffort || !modelRequiresDefaultSampling(model)) {
+    return {};
+  }
+  return { reasoning_effort: reasoningEffort };
+};
+
 const isConfigured = () => {
   return Boolean(resolveClientConfig());
 };
 
-const getClient = () => {
-  const resolved = resolveClientConfig();
+const getClient = (deploymentOverride) => {
+  const resolved = resolveClientConfig(deploymentOverride);
   if (!resolved) {
     return null;
   }
 
-  if (!cachedClient || cachedClientCacheKey !== resolved.cacheKey) {
-    cachedClient = resolved.client;
-    cachedClientCacheKey = resolved.cacheKey;
+  let client = clientCache.get(resolved.cacheKey);
+  if (!client) {
+    client = resolved.client;
+    clientCache.set(resolved.cacheKey, client);
   }
 
   return {
-    client: cachedClient,
+    client,
     mode: resolved.mode,
     model: resolved.model,
   };
@@ -151,8 +218,9 @@ const completeText = async ({
   maxTokens,
   temperature = DEFAULT_TEMPERATURE,
   topP = 1,
+  deployment,
 }) => {
-  const resolvedClient = getClient();
+  const resolvedClient = getClient(deployment);
   if (!resolvedClient || process.env.NODE_ENV === 'test') {
     return null;
   }
@@ -202,8 +270,12 @@ const completeJson = async ({
   messages,
   maxTokens,
   temperature = 0.1,
+  timeoutMs,
+  maxRetries,
+  deployment,
+  reasoningEffort,
 }) => {
-  const resolvedClient = getClient();
+  const resolvedClient = getClient(deployment);
   if (!resolvedClient || process.env.NODE_ENV === 'test') {
     return null;
   }
@@ -212,14 +284,18 @@ const completeJson = async ({
   const startedAt = Date.now();
 
   try {
-    const completion = await client.chat.completions.create({
-      model,
-      messages: normalizeMessages({ system, prompt, messages }),
-      ...buildTokenLimitParams(maxTokens),
-      ...buildSamplingParams({ model, temperature }),
-      response_format: { type: 'json_object' },
-      stream: false,
-    });
+    const completion = await client.chat.completions.create(
+      {
+        model,
+        messages: normalizeMessages({ system, prompt, messages }),
+        ...buildTokenLimitParams(maxTokens),
+        ...buildSamplingParams({ model, temperature }),
+        ...buildReasoningParams({ model, reasoningEffort }),
+        response_format: { type: 'json_object' },
+        stream: false,
+      },
+      buildRequestOptions({ timeoutMs, maxRetries }),
+    );
 
     const text = completion.choices?.[0]?.message?.content?.trim() || '';
     const json = extractJson(text);
@@ -302,8 +378,9 @@ const completeJsonResponses = async ({
   jsonSchema,
   timeoutMs = 120000,
   maxRetries = 0,
+  deployment,
 }) => {
-  const resolvedClient = getClient();
+  const resolvedClient = getClient(deployment);
   if (!resolvedClient || process.env.NODE_ENV === 'test') {
     return null;
   }
@@ -359,6 +436,9 @@ module.exports = {
   extractJson,
   getMaxTokens,
   getClient,
+  getStatementDeployment,
+  getStatementProfile,
+  getFastDeployment,
   isConfigured,
   isOpenAIV1Endpoint,
   modelRequiresDefaultSampling,

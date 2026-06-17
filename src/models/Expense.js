@@ -242,4 +242,7 @@ expenseSchema.pre('save', async function(next) {
   next();
 });
 
+// Invalidate cached insight snapshots when expenses change.
+expenseSchema.plugin(require('./plugins/invalidateInsightSnapshot'));
+
 module.exports = mongoose.model('Expense', expenseSchema);

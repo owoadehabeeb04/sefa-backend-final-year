@@ -150,6 +150,10 @@ const bindSocketHandlers = (socket, authState) => {
           startGeneration: false,
           onDelta: async (deltaEvent) => {
             state.activeAssistantMessageId = deltaEvent.assistantMessageId;
+            if (deltaEvent.type) {
+              sendEvent(socket, deltaEvent.type, deltaEvent);
+              return;
+            }
             sendEvent(socket, deltaEvent.isFinal ? 'assistant.done' : 'assistant.delta', deltaEvent);
           },
         });
@@ -184,6 +188,10 @@ const bindSocketHandlers = (socket, authState) => {
           sourceMessage: result.userMessage,
           onDelta: async (deltaEvent) => {
             state.activeAssistantMessageId = deltaEvent.assistantMessageId;
+            if (deltaEvent.type) {
+              sendEvent(socket, deltaEvent.type, deltaEvent);
+              return;
+            }
             sendEvent(socket, deltaEvent.isFinal ? 'assistant.done' : 'assistant.delta', deltaEvent);
           },
         });

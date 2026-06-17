@@ -1,5 +1,10 @@
 const { successResponse, errorResponse } = require('../utils/response');
 const {
+  cancelAction: cancelPendingAction,
+  editAction: editPendingAction,
+  executeAction,
+} = require('../services/assistantAction.service');
+const {
   archiveChat,
   cancelAssistantMessage,
   createChatWithFirstMessage,
@@ -15,11 +20,14 @@ const {
   searchAssistantChats,
   sendMessageToChat,
 } = require('../services/assistant.service');
-const { subscribeToAssistantChatEvents } = require('../services/assistantEvents.service');
+const {
+  publishAssistantChatEvent,
+  subscribeToAssistantChatEvents,
+} = require('../services/assistantEvents.service');
 
 const toStatusCode = (message = '') => {
   if (/not found/i.test(message)) return 404;
-  if (/cannot|only|required|archived/i.test(message)) return 400;
+  if (/already|archived|cannot|expired|invalid|only|required|unsupported/i.test(message)) return 400;
   return 500;
 };
 
@@ -217,5 +225,63 @@ exports.cancelMessage = async (req, res) => {
     const statusCode = toStatusCode(error.message);
     if (statusCode >= 500) console.error('Cancel assistant message error:', error);
     return errorResponse(res, error.message || 'Failed to cancel assistant response', statusCode);
+  }
+};
+
+exports.confirmAction = async (req, res) => {
+  try {
+    const action = await executeAction(req.user.userId, req.params.actionId);
+    publishAssistantChatEvent(action.chatId, {
+      type: 'action.completed',
+      actionId: String(action._id),
+      actionType: action.actionType,
+      status: action.status,
+      result: action.result || null,
+    });
+    return successResponse(res, {
+      action,
+    }, 'Assistant action completed successfully');
+  } catch (error) {
+    const statusCode = toStatusCode(error.message);
+    if (statusCode >= 500) console.error('Confirm assistant action error:', error);
+    return errorResponse(res, error.message || 'Failed to confirm assistant action', statusCode);
+  }
+};
+
+exports.cancelAction = async (req, res) => {
+  try {
+    const action = await cancelPendingAction(req.user.userId, req.params.actionId);
+    publishAssistantChatEvent(action.chatId, {
+      type: 'action.cancelled',
+      actionId: String(action._id),
+      actionType: action.actionType,
+      status: action.status,
+    });
+    return successResponse(res, {
+      action,
+    }, 'Assistant action cancelled successfully');
+  } catch (error) {
+    const statusCode = toStatusCode(error.message);
+    if (statusCode >= 500) console.error('Cancel assistant action error:', error);
+    return errorResponse(res, error.message || 'Failed to cancel assistant action', statusCode);
+  }
+};
+
+exports.editAction = async (req, res) => {
+  try {
+    const action = await editPendingAction(req.user.userId, req.params.actionId, req.body || {});
+    publishAssistantChatEvent(action.chatId, {
+      type: 'action.updated',
+      actionId: String(action._id),
+      actionType: action.actionType,
+      status: action.status,
+    });
+    return successResponse(res, {
+      action,
+    }, 'Assistant action updated successfully');
+  } catch (error) {
+    const statusCode = toStatusCode(error.message);
+    if (statusCode >= 500) console.error('Edit assistant action error:', error);
+    return errorResponse(res, error.message || 'Failed to edit assistant action', statusCode);
   }
 };

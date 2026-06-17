@@ -8,6 +8,34 @@ const insightsController = require('../controllers/insights.controller');
  */
 router.use(protect, requireVerifiedEmail, requireOnboardingComplete);
 
+/* ------------------------------------------------------------------ *
+ * Financial Intelligence Dashboard (calculated-first, AI explains).
+ * These endpoints are backed by the cached MonthlyInsightSnapshot.
+ * Optional query: ?period=YYYY-MM (defaults to current month),
+ *                 ?refresh=true to force recalculation.
+ * ------------------------------------------------------------------ */
+
+/**
+ * @swagger
+ * /api/v1/insights/dashboard:
+ *   get:
+ *     summary: Full financial intelligence dashboard (cached snapshot)
+ *     tags: [Insights]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Dashboard generated
+ */
+router.get('/dashboard', insightsController.getDashboard);
+router.get('/overview', insightsController.getOverview);
+router.get('/category-breakdown', insightsController.getCategoryBreakdown);
+router.get('/spending-drivers', insightsController.getSpendingDrivers);
+router.get('/savings-opportunities', insightsController.getSavingsOpportunities);
+router.get('/budget-health', insightsController.getBudgetHealth);
+router.get('/summary/stream', insightsController.streamSummary);
+router.get('/summary', insightsController.getSummary);
+
 /**
  * @swagger
  * /api/v1/insights/comprehensive:

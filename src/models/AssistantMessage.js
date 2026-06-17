@@ -118,6 +118,43 @@ const assistantRetrievalSchema = new mongoose.Schema(
   { _id: false },
 );
 
+const assistantActionSummarySchema = new mongoose.Schema(
+  {
+    actionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'AssistantAction',
+      required: true,
+    },
+    actionType: {
+      type: String,
+      required: true,
+      trim: true,
+      maxlength: 80,
+    },
+    status: {
+      type: String,
+      required: true,
+      trim: true,
+      maxlength: 80,
+    },
+    confirmationMessage: {
+      type: String,
+      required: true,
+      trim: true,
+      maxlength: 1000,
+    },
+    payload: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+    },
+    missingFields: {
+      type: [String],
+      default: [],
+    },
+  },
+  { _id: false },
+);
+
 const assistantMessageSchema = new mongoose.Schema(
   {
     chatId: {
@@ -216,6 +253,10 @@ const assistantMessageSchema = new mongoose.Schema(
     retrieval: {
       type: assistantRetrievalSchema,
       default: null,
+    },
+    actions: {
+      type: [assistantActionSummarySchema],
+      default: [],
     },
   },
   {
