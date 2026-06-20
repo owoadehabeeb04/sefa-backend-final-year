@@ -149,6 +149,28 @@ const getVisibleMessages = async (chatId) =>
     ...visibleMessageQuery,
   }).sort({ createdAt: 1, _id: 1 });
 
+const getLatestVisibleMessagesByChat = async (chatIds = []) => {
+  if (!chatIds.length) return new Map();
+
+  const latestMessages = await AssistantMessage.aggregate([
+    {
+      $match: {
+        chatId: { $in: chatIds },
+        ...visibleMessageQuery,
+      },
+    },
+    { $sort: { createdAt: -1, _id: -1 } },
+    {
+      $group: {
+        _id: '$chatId',
+        message: { $first: '$$ROOT' },
+      },
+    },
+  ]);
+
+  return new Map(latestMessages.map(({ _id, message }) => [String(_id), message]));
+};
+
 const refreshChatState = async (chatId) => {
   const chat = await AssistantChat.findById(chatId);
   if (!chat) return null;
@@ -684,18 +706,7 @@ const listAssistantChats = async (userId, query = {}) => {
   ]);
 
   const chatIds = chats.map((chat) => chat._id);
-  const lastMessages = await AssistantMessage.find({
-    chatId: { $in: chatIds },
-    ...visibleMessageQuery,
-  }).sort({ createdAt: -1 });
-
-  const lastByChat = new Map();
-  lastMessages.forEach((message) => {
-    const key = String(message.chatId);
-    if (!lastByChat.has(key)) {
-      lastByChat.set(key, message);
-    }
-  });
+  const lastByChat = await getLatestVisibleMessagesByChat(chatIds);
 
   return {
     chats: chats.map((chat) => formatAssistantChat(chat, lastByChat.get(String(chat._id)) || null)),
@@ -739,7 +750,7 @@ const buildSnippet = (content = '', query = '') => {
 };
 
 const searchAssistantChats = async (userId, q) => {
-  const query = String(q || '').trim();
+  const query = String(q || '').trim().replace(/\s+/g, ' ').slice(0, 120);
   if (!query) {
     return { chats: [] };
   }
@@ -794,23 +805,11 @@ const searchAssistantChats = async (userId, q) => {
     deletedAt: null,
   });
 
-  const visibleMessages = await AssistantMessage.find({
-    chatId: { $in: chats.map((chat) => chat._id) },
-    ...visibleMessageQuery,
-  }).sort({ createdAt: -1 });
-
-  const lastByChat = new Map();
+  const lastByChat = await getLatestVisibleMessagesByChat(chats.map((chat) => chat._id));
   const matchByChat = new Map(messageMatches.map((match) => [
     String(match._id),
     match,
   ]));
-
-  visibleMessages.forEach((message) => {
-    const chatKey = String(message.chatId);
-    if (!lastByChat.has(chatKey)) {
-      lastByChat.set(chatKey, message);
-    }
-  });
 
   return {
     chats: chats
