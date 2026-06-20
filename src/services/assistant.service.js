@@ -200,7 +200,6 @@ const createAssistantPlaceholder = async ({
   }
 
   emitMessageEvent(chatId, 'message.created', placeholder);
-  await refreshChatState(chatId);
   return placeholder;
 };
 
@@ -992,7 +991,9 @@ const processAssistantGenerationJob = async ({
       };
     }
 
-    let lastPersistedAt = 0;
+    let lastPersistedAt = Date.now();
+    let lastPersistedLength = 0;
+    let lastCancellationCheckAt = Date.now();
 
     const generationResult = await streamAssistantCompletion({
       userId: chat.userId,
@@ -1000,13 +1001,19 @@ const processAssistantGenerationJob = async ({
       history,
       onActivity: emitActivity,
       onChunk: async ({ delta, fullText, isFinal }) => {
-        const current = await AssistantMessage.findById(assistantMessageId).select('status hiddenAt');
-        if (!current || current.status === 'cancelled' || current.status === 'superseded' || current.hiddenAt) {
-          throw new Error('ASSISTANT_STREAM_ABORTED');
+        const now = Date.now();
+        if (isFinal || now - lastCancellationCheckAt >= 500) {
+          const current = await AssistantMessage.findById(assistantMessageId).select('status hiddenAt').lean();
+          lastCancellationCheckAt = now;
+          if (!current || current.status === 'cancelled' || current.status === 'superseded' || current.hiddenAt) {
+            throw new Error('ASSISTANT_STREAM_ABORTED');
+          }
         }
 
-        const now = Date.now();
-        const shouldPersist = isFinal || now - lastPersistedAt >= 250 || fullText.length >= 80;
+        const shouldPersist = !isFinal && (
+          now - lastPersistedAt >= 500
+          || fullText.length - lastPersistedLength >= 160
+        );
 
         if (shouldPersist) {
           assistantMessage.content = fullText;
@@ -1016,7 +1023,20 @@ const processAssistantGenerationJob = async ({
           }
           await assistantMessage.save();
           lastPersistedAt = now;
+          lastPersistedLength = fullText.length;
           emitMessageEvent(chatId, 'message.updated', assistantMessage);
+        }
+
+        if (delta) {
+          publishAssistantChatEvent(chatId, {
+            type: 'assistant.delta',
+            chatId: String(chatId),
+            assistantMessageId: String(assistantMessage._id),
+            delta,
+            fullText,
+            isFinal: false,
+            status: 'streaming',
+          });
         }
 
         if (onDelta && delta) {

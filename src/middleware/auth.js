@@ -26,7 +26,9 @@ const authenticate = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId).select('tokenVersion isVerified onboardingCompleted onboardingStatus');
+    const user = await User.findById(decoded.userId)
+      .select('tokenVersion isVerified onboardingCompleted onboardingStatus')
+      .lean();
 
     if (!user) {
       return buildAuthError(res, 401, 'User not found');

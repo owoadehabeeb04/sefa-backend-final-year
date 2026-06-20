@@ -1,0 +1,34 @@
+name: Keep Render Backend Awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: render-keep-alive
+  cancel-in-progress: true
+
+jobs:
+  ping-render-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Ping Render health endpoint
+        env:
+          CONFIGURED_HEALTH_URL: ${{ secrets.RENDER_BACKEND_HEALTH_URL }}
+        run: |
+          HEALTH_URL="${CONFIGURED_HEALTH_URL:-https://sefa-backend-final-year.onrender.com/health}"
+          echo "Pinging Render health endpoint"
+          curl \
+            --fail \
+            --show-error \
+            --silent \
+            --location \
+            --retry 2 \
+            --retry-delay 5 \
+            --max-time 45 \
+            "$HEALTH_URL"
+          echo
+          echo "Render backend ping completed successfully."

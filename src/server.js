@@ -81,6 +81,33 @@ app.use(express.json({
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));
 
+// Surface real endpoint latency in logs and response headers so slow database or
+// external-service paths are visible without attaching a profiler in production.
+app.use((req, res, next) => {
+  const startedAt = process.hrtime.bigint();
+  let durationMs = 0;
+  const writeHead = res.writeHead;
+  res.writeHead = function writeHeadWithTiming(...args) {
+    durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    if (!res.headersSent) {
+      res.setHeader('Server-Timing', `app;dur=${durationMs.toFixed(1)}`);
+    }
+    return writeHead.apply(this, args);
+  };
+  res.on('finish', () => {
+    durationMs ||= Number(process.hrtime.bigint() - startedAt) / 1e6;
+    if (durationMs >= 750) {
+      console.warn('Slow API request', {
+        method: req.method,
+        path: req.originalUrl?.split('?')[0],
+        statusCode: res.statusCode,
+        durationMs: Math.round(durationMs),
+      });
+    }
+  });
+  next();
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({

@@ -1,4 +1,4 @@
-const { buildInsightsHub } = require('./insights/insightHub.service');
+const { buildDashboardForPeriod } = require('./insights/financialDashboard.service');
 const { listNormalizedTransactions, createDateRange } = require('./insights/insightHelpers');
 const { completeText, streamText } = require('./llm/azureOpenAI.service');
 const { buildAssistantSystemPrompt, buildAssistantTitlePrompts } = require('./prompts/financePrompts');
@@ -21,16 +21,18 @@ const summarizeTransactions = (transactions = []) =>
     date: new Date(transaction.date).toISOString().slice(0, 10),
   }));
 
-const buildFinanceSummary = ({ hub, recentTransactions }) => {
+const buildFinanceSummary = ({ dashboard, recentTransactions }) => {
   const summaryLines = [
-    `Headline: ${hub.summary.headline}`,
-    `Key takeaway: ${hub.summary.keyTakeaway}`,
-    `Next best action: ${hub.summary.nextBestAction}`,
-    `Projected month-end balance: ${formatCurrency(hub.forecast.projectedMonthEndBalance)}`,
-    `Overspending probability: ${Math.round(Number(hub.forecast.overspendingProbability || 0) * 100)}%`,
+    `Period: ${dashboard.periodLabel}`,
+    `Income: ${formatCurrency(dashboard.totalIncome)}`,
+    `Expenses: ${formatCurrency(dashboard.totalExpenses)}`,
+    `Balance: ${formatCurrency(dashboard.balance)}`,
+    `Spending rate: ${Math.round(Number(dashboard.spendingRate || 0) * 100)}% of income`,
+    `Overall budget used: ${Math.round(Number(dashboard.budgetUsage || 0))}%`,
+    `Estimated savings opportunity: ${formatCurrency(dashboard.savingsPotential)}`,
   ];
 
-  const topCategories = (hub.visuals?.spendingBreakdown?.categories || [])
+  const topCategories = (dashboard.categoryBreakdown || [])
     .slice(0, 4)
     .map((entry) => `${entry.categoryName}: ${formatCurrency(entry.amount)}`);
 
@@ -38,9 +40,9 @@ const buildFinanceSummary = ({ hub, recentTransactions }) => {
     summaryLines.push(`Top spending categories: ${topCategories.join(', ')}`);
   }
 
-  const alerts = (hub.anomalies?.alerts || []).slice(0, 2).map((alert) => alert.title);
-  if (alerts.length) {
-    summaryLines.push(`Things to check: ${alerts.join(' | ')}`);
+  const drivers = (dashboard.spendingDrivers || []).slice(0, 2).map((driver) => driver.title || driver.categoryName);
+  if (drivers.length) {
+    summaryLines.push(`Main spending drivers: ${drivers.join(' | ')}`);
   }
 
   if (recentTransactions.length) {
@@ -130,19 +132,15 @@ const buildAssistantLiveWebContext = ({ question, retrieval }) => {
   return lines.join('\n');
 };
 
-const buildFallbackAnswer = ({ hub, question }) => {
+const buildFallbackAnswer = ({ dashboard, question }) => {
   const answerParts = [
-    hub.summary.headline,
-    hub.summary.keyTakeaway,
+    `For ${dashboard.periodLabel}, you received ${formatCurrency(dashboard.totalIncome)} and spent ${formatCurrency(dashboard.totalExpenses)}.`,
+    `Your balance for the period is ${formatCurrency(dashboard.balance)}.`,
   ];
 
   if (/save|cut|reduce|budget/i.test(question)) {
-    answerParts.push(hub.recommendations.nextBestAction);
-  } else if (/risk|fraud|odd|anomaly|weird/i.test(question)) {
-    const firstAlert = hub.anomalies?.alerts?.[0];
-    answerParts.push(firstAlert ? firstAlert.recommendedAction : 'No major risky pattern stands out right now.');
-  } else {
-    answerParts.push(hub.summary.nextBestAction);
+    const opportunity = dashboard.savingsOpportunities?.[0];
+    answerParts.push(opportunity?.action || opportunity?.title || 'Start with your largest spending category.');
   }
 
   return answerParts.filter(Boolean).join(' ');
@@ -242,10 +240,37 @@ const generateAssistantConversationTitle = async ({ messages = [] }) => {
   }
 };
 
+const CONTEXT_CACHE_TTL_MS = 15_000;
+const contextCache = new Map();
+
 const buildAssistantContext = async (userId) => {
+  if (process.env.NODE_ENV === 'test') {
+    return {
+      dashboard: {
+        periodLabel: 'this month',
+        totalIncome: 0,
+        totalExpenses: 0,
+        balance: 0,
+        spendingRate: 0,
+        budgetUsage: 0,
+        savingsPotential: 0,
+        categoryBreakdown: [],
+        spendingDrivers: [],
+        savingsOpportunities: [],
+      },
+      recentTransactions: [],
+    };
+  }
+
+  const cacheKey = String(userId);
+  const cached = contextCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
   const range = createDateRange({ days: 30 });
-  const [hub, transactions] = await Promise.all([
-    buildInsightsHub(userId, { months: 3, days: 30 }),
+  const [dashboard, transactions] = await Promise.all([
+    buildDashboardForPeriod(userId),
     listNormalizedTransactions(userId, {
       startDate: range.startDate,
       endDate: range.endDate,
@@ -253,10 +278,12 @@ const buildAssistantContext = async (userId) => {
     }),
   ]);
 
-  return {
-    hub,
+  const value = {
+    dashboard,
     recentTransactions: summarizeTransactions(transactions),
   };
+  contextCache.set(cacheKey, { value, expiresAt: Date.now() + CONTEXT_CACHE_TTL_MS });
+  return value;
 };
 
 const streamAssistantCompletion = async ({ userId, chatTitle, history, onChunk, onActivity }) => {
@@ -283,7 +310,7 @@ const streamAssistantCompletion = async ({ userId, chatTitle, history, onChunk, 
   await onActivity?.('preparing_answer', 'Preparing your answer...');
 
   if (process.env.NODE_ENV === 'test') {
-    const fallback = buildFallbackAnswer({ hub: context.hub, question: latestQuestion });
+    const fallback = buildFallbackAnswer({ dashboard: context.dashboard, question: latestQuestion });
     if (onChunk && fallback) {
       await onChunk({
         delta: fallback,

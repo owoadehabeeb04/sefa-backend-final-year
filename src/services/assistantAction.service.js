@@ -468,6 +468,13 @@ const callPlannerModel = async ({ text, pendingAction = null, history = [] }) =>
   };
 };
 
+const looksLikeWriteAction = (text = '') => {
+  const normalized = String(text || '').toLowerCase();
+  return /\b(add|record|log|create|track|enter)\b.{0,80}\b(expense|income|transaction|category|salary|payment)\b/.test(normalized)
+    || /\b(add|record|log|enter)\b.{0,80}\d/.test(normalized)
+    || /\b(i\s+)?(spent|paid|received|earned|got paid)\b.{0,80}\d/.test(normalized);
+};
+
 const PlannerState = Annotation.Root({
   userId: Annotation(),
   chatId: Annotation(),
@@ -643,7 +650,10 @@ const answerReadIntent = async ({ userId, intent, payload = {} }) => {
 };
 
 const planAssistantAction = async ({ userId, chatId, assistantMessageId, text, history = [] }) => {
-  const pendingConfirmation = await findPendingConfirmationAction(userId, chatId);
+  const [pendingConfirmation, pendingFields] = await Promise.all([
+    findPendingConfirmationAction(userId, chatId),
+    findPendingFieldsAction(userId, chatId),
+  ]);
   if (pendingConfirmation && isTextCancellation(text)) {
     const action = await cancelAction(userId, pendingConfirmation._id);
     action.assistantMessageId = assistantMessageId;
@@ -668,6 +678,12 @@ const planAssistantAction = async ({ userId, chatId, assistantMessageId, text, h
       action,
       text: `Done, I recorded that ${ACTION_LABELS[action.actionType] || 'action'} in SEFA.`,
     };
+  }
+
+  // Ordinary questions go straight to the streaming answer. Calling a second
+  // model just to decide that they are not write commands adds several seconds.
+  if (!pendingFields && !looksLikeWriteAction(text)) {
+    return null;
   }
 
   const graph = getPlannerGraph();
