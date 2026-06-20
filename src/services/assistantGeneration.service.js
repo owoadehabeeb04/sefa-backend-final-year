@@ -40,7 +40,11 @@ const buildFinanceSummary = ({ dashboard, recentTransactions }) => {
     summaryLines.push(`Top spending categories: ${topCategories.join(', ')}`);
   }
 
-  const drivers = (dashboard.spendingDrivers || []).slice(0, 2).map((driver) => driver.title || driver.categoryName);
+  const spendingDrivers = dashboard.spendingDrivers || {};
+  const drivers = [
+    spendingDrivers.topSpendingCategory?.categoryName,
+    spendingDrivers.fastestGrowingCategory?.categoryName || spendingDrivers.mostFrequentCategory?.categoryName,
+  ].filter(Boolean).slice(0, 2);
   if (drivers.length) {
     summaryLines.push(`Main spending drivers: ${drivers.join(' | ')}`);
   }

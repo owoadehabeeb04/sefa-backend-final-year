@@ -1097,6 +1097,15 @@ const processAssistantGenerationJob = async ({
       return { success: false, skipped: true };
     }
 
+    console.error('Assistant generation failed', {
+      chatId: String(chatId),
+      assistantMessageId: String(assistantMessageId),
+      message: error?.message,
+      status: error?.status || error?.statusCode,
+      code: error?.code,
+      stack: error?.stack,
+    });
+
     const current = await AssistantMessage.findById(assistantMessageId);
     if (!current || current.status === 'cancelled' || current.status === 'superseded' || current.hiddenAt) {
       return { success: false, skipped: true };
