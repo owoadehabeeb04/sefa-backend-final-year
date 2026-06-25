@@ -14,6 +14,7 @@ const {
   validateUpdateProfile,
   validateForgotPassword,
   validateResetPassword,
+  validateChangePassword,
   validateLogout,
   validateRefreshToken,
   validateVerifyEmail,
@@ -331,6 +332,49 @@ router.post(
  *         description: Validation error
  */
 router.post('/reset-password', otpVerifyLimiter, validateResetPassword, authController.resetPassword);
+
+/**
+ * @swagger
+ * /api/v1/auth/change-password:
+ *   post:
+ *     summary: Change password for the authenticated user (no OTP)
+ *     description: Verifies the current password and sets a new one. Returns fresh tokens so the current device stays signed in while other sessions are invalidated.
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - currentPassword
+ *               - newPassword
+ *             properties:
+ *               currentPassword:
+ *                 type: string
+ *                 example: OldSecurePass123!
+ *               newPassword:
+ *                 type: string
+ *                 example: NewSecurePass123!
+ *     responses:
+ *       200:
+ *         description: Password changed successfully
+ *       400:
+ *         description: New password must differ from the current password
+ *       401:
+ *         description: Current password is incorrect / unauthorized
+ *       422:
+ *         description: Validation error
+ */
+router.post(
+  '/change-password',
+  authenticate,
+  requireVerifiedEmail,
+  validateChangePassword,
+  authController.changePassword
+);
 
 /**
  * @swagger

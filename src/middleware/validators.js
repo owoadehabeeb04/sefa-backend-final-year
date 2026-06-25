@@ -147,6 +147,23 @@ exports.validateResetPassword = [
   handleValidationErrors
 ];
 
+// Change password validation (authenticated user, no OTP)
+exports.validateChangePassword = [
+  body('currentPassword')
+    .notEmpty()
+    .withMessage('Current password is required'),
+
+  body('newPassword')
+    .notEmpty()
+    .withMessage('New password is required')
+    .isLength({ min: 8 })
+    .withMessage('Password must be at least 8 characters')
+    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
+    .withMessage('Password must contain at least one uppercase letter, one lowercase letter, and one number'),
+
+  handleValidationErrors
+];
+
 // Refresh token validation
 exports.validateRefreshToken = [
   body('refreshToken')

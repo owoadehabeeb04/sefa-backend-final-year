@@ -370,6 +370,49 @@ exports.resetPassword = async (req, res) => {
 };
 
 /**
+ * @route   POST /api/v1/auth/change-password
+ * @desc    Change password for an authenticated user (verifies current password, no OTP)
+ * @access  Private
+ */
+exports.changePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    const user = await User.findById(req.user.userId).select('+password');
+
+    if (!user) {
+      return errorResponse(res, 'User not found', 404);
+    }
+
+    const isCurrentValid = await user.comparePassword(currentPassword);
+    if (!isCurrentValid) {
+      return errorResponse(res, 'Current password is incorrect', 401);
+    }
+
+    const isSamePassword = await user.comparePassword(newPassword);
+    if (isSamePassword) {
+      return errorResponse(res, 'New password must be different from the current password', 400);
+    }
+
+    user.password = newPassword;
+    // Invalidate sessions on other devices, then re-issue tokens so the current
+    // device stays signed in with a token that matches the new tokenVersion.
+    user.bumpTokenVersion();
+    await user.save();
+
+    const tokens = issueAuthTokens(user);
+
+    return successResponse(
+      res,
+      { user: buildUserPayload(user), ...tokens },
+      'Your password has been changed successfully'
+    );
+  } catch (error) {
+    console.error('Change password error:', error);
+    return errorResponse(res, 'Failed to change password', 500, error.message);
+  }
+};
+
+/**
  * @route   POST /api/v1/auth/logout
  * @desc    Logout user from all sessions
  * @access  Private
